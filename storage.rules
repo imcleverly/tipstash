@@ -1,0 +1,68 @@
+rules_version = '2';
+
+service firebase.storage {
+  match /b/{bucket}/o {
+    function isTopicOwner(topicId) {
+      let path = /databases/(default)/documents/topics/$(topicId);
+      return request.auth != null && firestore.exists(path)
+        ? firestore.get(path).data.ownerId == request.auth.uid
+        : false;
+    }
+
+    function hasEditorRole(topicId) {
+      return request.auth != null
+        ? (firestore.exists(/databases/(default)/documents/topics/$(topicId)/members/$(request.auth.uid))
+          ? firestore.get(/databases/(default)/documents/topics/$(topicId)/members/$(request.auth.uid)).data.role == 'editor'
+          : false)
+        : false;
+    }
+
+    function canViewTopic(topicId) {
+      return isTopicOwner(topicId)
+        ? true
+        : request.auth != null
+          ? (firestore.exists(/databases/(default)/documents/topics/$(topicId)/members/$(request.auth.uid))
+            ? firestore.get(/databases/(default)/documents/topics/$(topicId)/members/$(request.auth.uid)).data.role in ['viewer', 'editor']
+            : false)
+          : false;
+    }
+
+    function hasActivePublicLink(topicId) {
+      let topicPath = /databases/(default)/documents/topics/$(topicId);
+      return firestore.exists(topicPath)
+        ? (firestore.get(topicPath).data.publicShareId is string
+          ? (firestore.exists(/databases/(default)/documents/publicShares/$(firestore.get(topicPath).data.publicShareId))
+            ? firestore.get(/databases/(default)/documents/publicShares/$(firestore.get(topicPath).data.publicShareId)).data.get('topicId', '') == topicId
+              && firestore.get(/databases/(default)/documents/publicShares/$(firestore.get(topicPath).data.publicShareId)).data.get('active', false) == true
+            : false)
+          : false)
+        : false;
+    }
+
+    function canEditTopic(topicId) {
+      return isTopicOwner(topicId) || hasEditorRole(topicId);
+    }
+
+    function supportedFileType(contentType) {
+      return contentType in ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/avif']
+        || contentType == 'application/pdf'
+        || contentType == 'application/msword'
+        || contentType == 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+        || contentType == 'application/vnd.ms-excel'
+        || contentType == 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        || contentType == 'application/vnd.ms-powerpoint'
+        || contentType == 'application/vnd.openxmlformats-officedocument.presentationml.presentation'
+        || contentType == 'application/vnd.oasis.opendocument.text'
+        || contentType == 'application/vnd.oasis.opendocument.spreadsheet'
+        || contentType == 'application/vnd.oasis.opendocument.presentation';
+    }
+
+    match /topics/{topicId}/{filePath=**} {
+      allow read: if canViewTopic(topicId) || hasActivePublicLink(topicId);
+      allow create, update: if canEditTopic(topicId)
+        && request.resource.size <= 25 * 1024 * 1024
+        && supportedFileType(request.resource.contentType);
+      allow delete: if canEditTopic(topicId);
+    }
+  }
+}

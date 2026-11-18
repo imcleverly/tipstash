@@ -1,0 +1,279 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function hasVerifiedEmail() {
+      return signedIn()
+        && request.auth.token.email_verified == true
+        && request.auth.token.email is string;
+    }
+
+    function emailHash() {
+      return hashing.sha256(request.auth.token.email.lower().toUtf8()).toHexString().lower();
+    }
+
+    function topicPath(topicId) {
+      return /databases/$(database)/documents/topics/$(topicId);
+    }
+
+    function memberPath(topicId, uid) {
+      return /databases/$(database)/documents/topics/$(topicId)/members/$(uid);
+    }
+
+    function isTopicOwner(topicId) {
+      return signedIn() && exists(topicPath(topicId))
+        ? get(topicPath(topicId)).data.ownerId == request.auth.uid
+        : false;
+    }
+
+    function hasTopicMembership(topicId) {
+      return signedIn() && exists(memberPath(topicId, request.auth.uid));
+    }
+
+    function topicMemberRole(topicId, uid) {
+      return exists(memberPath(topicId, uid))
+        ? get(memberPath(topicId, uid)).data.role
+        : '';
+    }
+
+    function canViewTopic(topicId) {
+      return signedIn()
+        ? (isTopicOwner(topicId)
+          ? true
+          : topicMemberRole(topicId, request.auth.uid) in ['viewer', 'editor'])
+        : false;
+    }
+
+    function canEditTopic(topicId) {
+      return isTopicOwner(topicId)
+        || (hasTopicMembership(topicId)
+          && get(memberPath(topicId, request.auth.uid)).data.role == 'editor');
+    }
+
+    function activePublicShare(topicId, shareId) {
+      return shareId is string
+        ? (exists(/databases/$(database)/documents/publicShares/$(shareId))
+          ? get(/databases/$(database)/documents/publicShares/$(shareId)).data.active == true
+            && get(/databases/$(database)/documents/publicShares/$(shareId)).data.topicId == topicId
+          : false)
+        : false;
+    }
+
+    function activeTopicShare(topicId) {
+      return exists(topicPath(topicId))
+        ? activePublicShare(topicId, get(topicPath(topicId)).data.get('publicShareId', null))
+        : false;
+    }
+
+    function isInvitee(invitation) {
+      return hasVerifiedEmail()
+        && invitation.inviteeEmailHash == emailHash();
+    }
+
+    match /usernames/{username} {
+      allow get: if signedIn();
+      allow list: if false;
+
+      allow create: if signedIn()
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.username == username
+        && request.resource.data.keys().hasAll(['uid', 'username', 'displayName', 'avatarUrl'])
+        && request.resource.data.keys().hasOnly(['uid', 'username', 'displayName', 'avatarUrl', 'createdAt', 'updatedAt'])
+        && !exists(/databases/$(database)/documents/usernames/$(username));
+
+      allow update: if signedIn()
+        && resource.data.uid == request.auth.uid
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.username == username
+        && request.resource.data.keys().hasOnly(['uid', 'username', 'displayName', 'avatarUrl', 'createdAt', 'updatedAt']);
+
+      allow delete: if signedIn() && resource.data.uid == request.auth.uid;
+    }
+
+    match /users/{userId} {
+      allow get: if signedIn() && userId == request.auth.uid;
+      allow list: if false;
+      allow create: if signedIn()
+        && userId == request.auth.uid
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.email == request.auth.token.email
+        && request.resource.data.keys().hasAll(['uid', 'email', 'username', 'displayName', 'avatarUrl'])
+        && request.resource.data.keys().hasOnly([
+          'uid', 'email', 'username', 'displayName', 'avatarUrl', 'createdAt', 'updatedAt'
+        ]);
+      allow update: if signedIn()
+        && userId == request.auth.uid
+        && request.resource.data.uid == resource.data.uid
+        && request.resource.data.email == resource.data.email
+        && request.resource.data.keys().hasOnly([
+          'uid', 'email', 'username', 'displayName', 'avatarUrl', 'createdAt', 'updatedAt'
+        ]);
+      allow delete: if signedIn() && userId == request.auth.uid;
+    }
+
+    // This recursive rule lets each user query their own membership across topics.
+    match /{path=**}/members/{memberUid} {
+      allow get, list: if signedIn() && resource.data.uid == request.auth.uid;
+    }
+
+    match /topics/{topicId} {
+      allow get: if canViewTopic(topicId)
+        ? true
+        : activePublicShare(topicId, resource.data.get('publicShareId', null));
+
+      allow list: if signedIn()
+        && (resource.data.ownerId == request.auth.uid || hasTopicMembership(topicId));
+
+      allow create: if signedIn()
+        && request.resource.data.ownerId == request.auth.uid
+        && request.resource.data.visibility == 'private'
+        && request.resource.data.publicShareId == null
+        && request.resource.data.keys().hasAll([
+          'ownerId', 'title', 'description', 'coverImagePath', 'visibility',
+          'publicShareId', 'createdAt', 'updatedAt'
+        ])
+        && request.resource.data.keys().hasOnly([
+          'ownerId', 'title', 'description', 'coverImagePath', 'visibility',
+          'publicShareId', 'createdAt', 'updatedAt'
+        ]);
+
+      allow update: if canEditTopic(topicId)
+        && request.resource.data.ownerId == resource.data.ownerId
+        && request.resource.data.createdAt == resource.data.createdAt
+        && request.resource.data.keys().hasOnly([
+          'ownerId', 'title', 'description', 'coverImagePath', 'visibility',
+          'publicShareId', 'createdAt', 'updatedAt'
+        ])
+        && (
+          (isTopicOwner(topicId)
+            && request.resource.data.visibility == resource.data.visibility
+            || isTopicOwner(topicId)
+              && request.resource.data.visibility in ['private', 'unlisted'])
+          || request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'title', 'description', 'coverImagePath', 'updatedAt'
+          ])
+        );
+
+      allow delete: if isTopicOwner(topicId);
+
+      match /tips/{tipId} {
+        allow get, list: if canViewTopic(topicId)
+          ? true
+          : activeTopicShare(topicId);
+
+        allow create: if canEditTopic(topicId)
+          && request.resource.data.keys().hasAll([
+            'title', 'summary', 'blocks', 'position', 'createdBy', 'createdAt', 'updatedAt'
+          ])
+          && request.resource.data.keys().hasOnly([
+            'title', 'summary', 'blocks', 'position', 'createdBy', 'createdAt', 'updatedAt'
+          ])
+          && request.resource.data.createdBy == request.auth.uid;
+
+        allow update: if canEditTopic(topicId)
+          && request.resource.data.createdBy == resource.data.createdBy
+          && request.resource.data.createdAt == resource.data.createdAt
+          && request.resource.data.keys().hasOnly([
+            'title', 'summary', 'blocks', 'position', 'createdBy', 'createdAt', 'updatedAt'
+          ]);
+
+        allow delete: if canEditTopic(topicId);
+      }
+
+      match /members/{memberUid} {
+        allow get, list: if signedIn()
+          && (resource.data.uid == request.auth.uid || canViewTopic(topicId));
+
+        allow create: if canEditTopic(topicId)
+          && request.resource.data.uid == memberUid
+          && request.resource.data.role in ['viewer', 'editor']
+          && request.resource.data.keys().hasOnly(['uid', 'role', 'invitationId', 'addedAt']);
+
+        allow create: if signedIn()
+          && memberUid == request.auth.uid
+          && request.resource.data.uid == request.auth.uid
+          && request.resource.data.role in ['viewer', 'editor']
+          && request.resource.data.keys().hasOnly(['uid', 'role', 'invitationId', 'addedAt'])
+          && request.resource.data.invitationId is string
+          && getAfter(/databases/$(database)/documents/invitations/$(request.resource.data.invitationId)).data.status == 'accepted'
+          && getAfter(/databases/$(database)/documents/invitations/$(request.resource.data.invitationId)).data.acceptedBy == request.auth.uid
+          && getAfter(/databases/$(database)/documents/invitations/$(request.resource.data.invitationId)).data.topicId == topicId
+          && getAfter(/databases/$(database)/documents/invitations/$(request.resource.data.invitationId)).data.inviteeEmailHash == emailHash()
+          && getAfter(/databases/$(database)/documents/invitations/$(request.resource.data.invitationId)).data.role == request.resource.data.role;
+
+        allow update: if isTopicOwner(topicId)
+          && request.resource.data.uid == memberUid
+          && request.resource.data.role in ['viewer', 'editor']
+          && request.resource.data.keys().hasOnly(['uid', 'role', 'invitationId', 'addedAt']);
+
+        allow delete: if isTopicOwner(topicId)
+          || (signedIn() && memberUid == request.auth.uid);
+      }
+    }
+
+    match /invitations/{invitationId} {
+      allow get, list: if signedIn()
+        && (resource.data.inviterUid == request.auth.uid || isInvitee(resource.data));
+
+      allow create: if signedIn()
+        && request.resource.data.inviterUid == request.auth.uid
+        && canEditTopic(request.resource.data.topicId)
+        && request.resource.data.invitedEmail is string
+        && request.resource.data.inviteeEmailHash == hashing.sha256(request.resource.data.invitedEmail.lower().toUtf8()).toHexString().lower()
+        && request.resource.data.role in ['viewer', 'editor']
+        && request.resource.data.status == 'pending'
+        && request.resource.data.keys().hasAll([
+          'topicId', 'inviterUid', 'invitedEmail', 'inviteeEmailHash',
+          'role', 'status', 'createdAt'
+        ])
+        && request.resource.data.keys().hasOnly([
+          'topicId', 'inviterUid', 'invitedEmail', 'inviteeEmailHash',
+          'role', 'status', 'createdAt', 'acceptedBy', 'acceptedAt'
+        ]);
+
+      allow update: if signedIn()
+        && resource.data.status == 'pending'
+        && (
+          (resource.data.inviterUid == request.auth.uid
+            && request.resource.data.status == 'revoked'
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt']))
+          || (isInvitee(resource.data)
+            && request.resource.data.status == 'accepted'
+            && request.resource.data.acceptedBy == request.auth.uid
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'acceptedBy', 'acceptedAt'])
+            && getAfter(memberPath(resource.data.topicId, request.auth.uid)).data.invitationId == invitationId)
+        );
+
+      allow delete: if signedIn()
+        && resource.data.inviterUid == request.auth.uid
+        && resource.data.status == 'pending';
+    }
+
+    match /publicShares/{shareId} {
+      allow get: if resource.data.active == true
+        || (signedIn() && resource.data.ownerUid == request.auth.uid);
+      allow list: if false;
+
+      allow create: if signedIn()
+        && request.resource.data.ownerUid == request.auth.uid
+        && request.resource.data.active == true
+        && request.resource.data.topicId is string
+        && request.resource.data.keys().hasAll(['topicId', 'ownerUid', 'active', 'createdAt'])
+        && isTopicOwner(request.resource.data.topicId)
+        && request.resource.data.keys().hasOnly(['topicId', 'ownerUid', 'active', 'createdAt', 'revokedAt']);
+
+      allow update: if signedIn()
+        && resource.data.ownerUid == request.auth.uid
+        && request.resource.data.ownerUid == resource.data.ownerUid
+        && resource.data.active == true
+        && request.resource.data.active == false
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['active', 'revokedAt']);
+
+      allow delete: if false;
+    }
+  }
+}

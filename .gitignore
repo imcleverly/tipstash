@@ -1,0 +1,17 @@
+.next/
+node_modules/
+out/
+dist/
+.vercel/
+.impeccable/
+.env*
+!.env.example
+firebase-debug.log
+firestore-debug.log
+ui-debug.log
+*.log
+*.tsbuildinfo
+coverage/
+playwright-report/
+test-results/
+.DS_Store
