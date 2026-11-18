@@ -25,7 +25,7 @@ Every upload is limited to 25 MB. The interface accepts JPEG, PNG, WebP, GIF, AV
 - topics/{topicId}: owner, title, description, cover path, visibility, and active public share id.
 - topics/{topicId}/tips/{tipId}: ordered TipBlock[] content.
 - topics/{topicId}/members/{uid}: viewer or editor role.
-- invitations/{invitationId}: pending email invitation, claimed only by the matching verified email.
+- invitations/{invitationId}: pending email or username invitation, claimable only by the matching verified email or username.
 - publicShares/{shareId}: active/revoked link state for one whole topic.
 
 Server endpoints verify Firebase ID tokens before username lookup and invitation creation. Public reads use an unguessable share id and the Firebase Web SDK, which continues to enforce Firestore rules. No Admin SDK credential is stored in Vercel.

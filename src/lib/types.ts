@@ -57,12 +57,13 @@ export interface TopicMember {
   addedAt?: unknown;
 }
 
-export interface EmailInvitation {
+export interface TopicInvitation {
   id: string;
   topicId: string;
   inviterUid: string;
-  invitedEmail: string;
-  inviteeEmailHash: string;
+  inviteeUsername?: string;
+  invitedEmail?: string;
+  inviteeEmailHash?: string;
   role: TopicRole;
   status: "pending" | "accepted" | "revoked";
   createdAt?: unknown;

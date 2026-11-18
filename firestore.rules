@@ -24,6 +24,14 @@ service cloud.firestore {
       return /databases/$(database)/documents/topics/$(topicId)/members/$(uid);
     }
 
+    function userPath(uid) {
+      return /databases/$(database)/documents/users/$(uid);
+    }
+
+    function usernamePath(username) {
+      return /databases/$(database)/documents/usernames/$(username);
+    }
+
     function isTopicOwner(topicId) {
       return signedIn() && exists(topicPath(topicId))
         ? get(topicPath(topicId)).data.ownerId == request.auth.uid
@@ -70,8 +78,12 @@ service cloud.firestore {
     }
 
     function isInvitee(invitation) {
-      return hasVerifiedEmail()
-        && invitation.inviteeEmailHash == emailHash();
+      return (hasVerifiedEmail()
+          && invitation.get('inviteeEmailHash', '') == emailHash())
+        || (signedIn()
+          && invitation.get('inviteeUsername', '') is string
+          && exists(userPath(request.auth.uid))
+          && get(userPath(request.auth.uid)).data.username == invitation.inviteeUsername);
     }
 
     match /usernames/{username} {
@@ -79,19 +91,21 @@ service cloud.firestore {
       allow list: if false;
 
       allow create: if signedIn()
-        && request.resource.data.uid == request.auth.uid
         && request.resource.data.username == username
-        && request.resource.data.keys().hasAll(['uid', 'username', 'displayName', 'avatarUrl'])
-        && request.resource.data.keys().hasOnly(['uid', 'username', 'displayName', 'avatarUrl', 'createdAt', 'updatedAt'])
-        && !exists(/databases/$(database)/documents/usernames/$(username));
+        && request.resource.data.keys().hasAll(['username', 'displayName', 'avatarUrl'])
+        && request.resource.data.keys().hasOnly(['username', 'displayName', 'avatarUrl', 'createdAt', 'updatedAt'])
+        && !exists(usernamePath(username))
+        && getAfter(userPath(request.auth.uid)).data.username == username;
 
       allow update: if signedIn()
-        && resource.data.uid == request.auth.uid
-        && request.resource.data.uid == request.auth.uid
+        && get(userPath(request.auth.uid)).data.username == username
+        && getAfter(userPath(request.auth.uid)).data.username == username
         && request.resource.data.username == username
-        && request.resource.data.keys().hasOnly(['uid', 'username', 'displayName', 'avatarUrl', 'createdAt', 'updatedAt']);
+        && request.resource.data.keys().hasOnly(['username', 'displayName', 'avatarUrl', 'createdAt', 'updatedAt']);
 
-      allow delete: if signedIn() && resource.data.uid == request.auth.uid;
+      allow delete: if signedIn()
+        && get(userPath(request.auth.uid)).data.username == username
+        && getAfter(userPath(request.auth.uid)).data.username != username;
     }
 
     match /users/{userId} {
@@ -104,14 +118,16 @@ service cloud.firestore {
         && request.resource.data.keys().hasAll(['uid', 'email', 'username', 'displayName', 'avatarUrl'])
         && request.resource.data.keys().hasOnly([
           'uid', 'email', 'username', 'displayName', 'avatarUrl', 'createdAt', 'updatedAt'
-        ]);
+        ])
+        && getAfter(usernamePath(request.resource.data.username)).data.username == request.resource.data.username;
       allow update: if signedIn()
         && userId == request.auth.uid
         && request.resource.data.uid == resource.data.uid
         && request.resource.data.email == resource.data.email
         && request.resource.data.keys().hasOnly([
           'uid', 'email', 'username', 'displayName', 'avatarUrl', 'createdAt', 'updatedAt'
-        ]);
+        ])
+        && getAfter(usernamePath(request.resource.data.username)).data.username == request.resource.data.username;
       allow delete: if signedIn() && userId == request.auth.uid;
     }
 
@@ -202,7 +218,7 @@ service cloud.firestore {
           && getAfter(/databases/$(database)/documents/invitations/$(request.resource.data.invitationId)).data.status == 'accepted'
           && getAfter(/databases/$(database)/documents/invitations/$(request.resource.data.invitationId)).data.acceptedBy == request.auth.uid
           && getAfter(/databases/$(database)/documents/invitations/$(request.resource.data.invitationId)).data.topicId == topicId
-          && getAfter(/databases/$(database)/documents/invitations/$(request.resource.data.invitationId)).data.inviteeEmailHash == emailHash()
+          && isInvitee(getAfter(/databases/$(database)/documents/invitations/$(request.resource.data.invitationId)).data)
           && getAfter(/databases/$(database)/documents/invitations/$(request.resource.data.invitationId)).data.role == request.resource.data.role;
 
         allow update: if isTopicOwner(topicId)
@@ -222,18 +238,28 @@ service cloud.firestore {
       allow create: if signedIn()
         && request.resource.data.inviterUid == request.auth.uid
         && canEditTopic(request.resource.data.topicId)
-        && request.resource.data.invitedEmail is string
-        && request.resource.data.inviteeEmailHash == hashing.sha256(request.resource.data.invitedEmail.lower().toUtf8()).toHexString().lower()
         && request.resource.data.role in ['viewer', 'editor']
         && request.resource.data.status == 'pending'
         && request.resource.data.keys().hasAll([
-          'topicId', 'inviterUid', 'invitedEmail', 'inviteeEmailHash',
-          'role', 'status', 'createdAt'
+          'topicId', 'inviterUid', 'role', 'status', 'createdAt'
         ])
         && request.resource.data.keys().hasOnly([
-          'topicId', 'inviterUid', 'invitedEmail', 'inviteeEmailHash',
+          'topicId', 'inviterUid', 'invitedEmail', 'inviteeEmailHash', 'inviteeUsername',
           'role', 'status', 'createdAt', 'acceptedBy', 'acceptedAt'
-        ]);
+        ])
+        && (
+          (request.resource.data.get('invitedEmail', '') is string
+            && request.resource.data.get('invitedEmail', '') != ''
+            && request.resource.data.get('inviteeEmailHash', '') == hashing.sha256(request.resource.data.invitedEmail.lower().toUtf8()).toHexString().lower()
+            && request.resource.data.get('inviteeUsername', '') == '')
+          || (request.resource.data.get('inviteeUsername', '') is string
+            && request.resource.data.inviteeUsername.matches('^[a-z0-9][a-z0-9._-]{2,23}$')
+            && request.resource.data.get('invitedEmail', '') == ''
+            && request.resource.data.get('inviteeEmailHash', '') == ''
+            && exists(userPath(request.auth.uid))
+            && request.resource.data.inviteeUsername != get(userPath(request.auth.uid)).data.username
+            && exists(usernamePath(request.resource.data.inviteeUsername)))
+        );
 
       allow update: if signedIn()
         && resource.data.status == 'pending'

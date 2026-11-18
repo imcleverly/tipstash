@@ -27,7 +27,7 @@ Users organize knowledge into topics and tips. A topic may be shared with named 
 - Topics have cover images and contain multiple tips. Tip content is an ordered set of rich-text, step, image, styled-label, and file-attachment blocks.
 - New topics are private. Topic access is granted with viewer or editor roles; tips inherit topic access.
 - Users sign in with Google and choose unique usernames. Exact-username lookup reveals only the username, display name, and avatar.
-- Email sharing resolves existing Firebase users; an unmatched email remains a pending invitation until someone signs in with that same verified email. No outbound email service is part of the initial release.
+- Username and email shares appear as pending invitations in the recipient’s library. Email invitations require sign-in with that verified email. No outbound email service is part of the initial release.
 - Public links are unlisted, read-only, scoped to a whole topic, and revocable.
 - Images and PDF/Office attachments are stored in Firebase Storage, up to 25 MB per file. Cloud Storage for Firebase requires the Blaze pay-as-you-go plan; usage may be billed beyond no-cost allowances.
 - Firestore and Storage use the `asia-southeast1` region. Source code is public in `imcleverly/tipstash`; production deployment is on Vercel.

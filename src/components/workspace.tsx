@@ -25,7 +25,7 @@ import { Icon } from "@/components/icons";
 import { auth, db, firebaseConfigured, storage } from "@/lib/firebase/client";
 import { messages } from "@/lib/i18n";
 import { validateUpload } from "@/lib/file-policy";
-import type { EmailInvitation, LabelTone, Locale, PublicUser, Tip, TipBlock, Topic, TopicRole, UserProfile } from "@/lib/types";
+import type { LabelTone, Locale, PublicUser, Tip, TipBlock, Topic, TopicInvitation, TopicRole, UserProfile } from "@/lib/types";
 
 const tones: LabelTone[] = ["line-red", "line-blue", "line-amber", "line-green", "ink"];
 const routeNames: Record<LabelTone, string> = {
@@ -47,7 +47,7 @@ async function hashEmail(email: string): Promise<string> {
   return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
-async function loadLibrary(user: User) {
+async function loadLibrary(user: User, username?: string) {
   const ownSnapshot = await getDocs(query(collection(db, "topics"), where("ownerId", "==", user.uid)));
   const topics = new Map<string, Topic>();
   ownSnapshot.docs.forEach((snapshot) => {
@@ -69,7 +69,7 @@ async function loadLibrary(user: User) {
   }));
 
   const result = [...topics.values()].sort((a, b) => timeValue(b.updatedAt) - timeValue(a.updatedAt));
-  let invitations: EmailInvitation[] = [];
+  const pendingInvitations = new Map<string, TopicInvitation>();
   if (user.email && user.emailVerified) {
     const digest = await hashEmail(user.email);
     const received = await getDocs(query(
@@ -77,9 +77,17 @@ async function loadLibrary(user: User) {
       where("inviteeEmailHash", "==", digest),
       where("status", "==", "pending"),
     ));
-    invitations = received.docs.map((snapshot) => ({ id: snapshot.id, ...snapshot.data() } as EmailInvitation));
+    received.docs.forEach((snapshot) => pendingInvitations.set(snapshot.id, { id: snapshot.id, ...snapshot.data() } as TopicInvitation));
   }
-  return { topics: result, invitations };
+  if (username) {
+    const received = await getDocs(query(
+      collection(db, "invitations"),
+      where("inviteeUsername", "==", username),
+      where("status", "==", "pending"),
+    ));
+    received.docs.forEach((snapshot) => pendingInvitations.set(snapshot.id, { id: snapshot.id, ...snapshot.data() } as TopicInvitation));
+  }
+  return { topics: result, invitations: [...pendingInvitations.values()] };
 }
 
 function Modal({ title, onClose, children, wide = false }: { title: string; onClose: () => void; children: React.ReactNode; wide?: boolean }) {
@@ -146,7 +154,7 @@ export function Workspace() {
   const [user, setUser] = useState<User | null>(null);
   const [profile, setProfile] = useState<UserProfile | null>(null);
   const [topics, setTopics] = useState<Topic[]>([]);
-  const [invitations, setInvitations] = useState<EmailInvitation[]>([]);
+  const [invitations, setInvitations] = useState<TopicInvitation[]>([]);
   const [busy, setBusy] = useState(true);
   const [working, setWorking] = useState(false);
   const [error, setError] = useState("");
@@ -188,15 +196,17 @@ export function Workspace() {
       setBusy(true);
       try {
         const profileSnapshot = await getDoc(doc(db, "users", nextUser.uid));
+        let nextUsername: string | undefined;
         if (profileSnapshot.exists()) {
           const data = profileSnapshot.data();
+          nextUsername = typeof data.username === "string" ? data.username : undefined;
           setProfile({ uid: nextUser.uid, email: nextUser.email ?? "", ...data } as UserProfile);
         } else {
           setProfile(null);
           setUsername("");
           setDisplayName(nextUser.displayName ?? "");
         }
-        const library = await loadLibrary(nextUser);
+        const library = await loadLibrary(nextUser, nextUsername);
         setTopics(library.topics);
         setInvitations(library.invitations);
       } catch (cause) {
@@ -240,9 +250,9 @@ export function Workspace() {
     setTips([]);
   }
 
-  async function refreshLibrary(nextUser = user) {
+  async function refreshLibrary(nextUser = user, nextUsername = profile?.username) {
     if (!nextUser) return;
-    const library = await loadLibrary(nextUser);
+    const library = await loadLibrary(nextUser, nextUsername);
     setTopics(library.topics);
     setInvitations(library.invitations);
   }
@@ -275,12 +285,18 @@ export function Workspace() {
     const usernameRef = doc(db, "usernames", cleanUsername);
     try {
       await runTransaction(db, async (transaction) => {
-        const existingUsername = await transaction.get(usernameRef);
-        if (existingUsername.exists() && existingUsername.data().uid !== user.uid) throw new Error("That username is already taken.");
+        const [existingUsername, existingProfile] = await Promise.all([
+          transaction.get(usernameRef),
+          transaction.get(userRef),
+        ]);
+        const currentUsername = existingProfile.exists() ? existingProfile.data().username : null;
+        if (existingUsername.exists() && currentUsername !== cleanUsername) throw new Error("That username is already taken.");
+        if (typeof currentUsername === "string" && currentUsername !== cleanUsername) {
+          transaction.delete(doc(db, "usernames", currentUsername));
+        }
         const now = serverTimestamp();
         const cleanName = displayName.trim() || user.displayName || cleanUsername;
         transaction.set(usernameRef, {
-          uid: user.uid,
           username: cleanUsername,
           displayName: cleanName,
           avatarUrl: user.photoURL ?? "",
@@ -299,6 +315,9 @@ export function Workspace() {
       });
       const snapshot = await getDoc(userRef);
       setProfile({ uid: user.uid, email: user.email, ...snapshot.data() } as UserProfile);
+      const library = await loadLibrary(user, cleanUsername);
+      setTopics(library.topics);
+      setInvitations(library.invitations);
       setNotice(t.continue);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : t.error);
@@ -491,7 +510,7 @@ export function Workspace() {
       setLookupUsername("");
       setInviteEmail("");
       await refreshLibrary(user);
-      setNotice(target.email ? t.pending : t.sharedBadge);
+      setNotice(t.pending);
     } catch (cause) {
       setLookupError(cause instanceof Error ? cause.message : t.error);
     } finally {
@@ -499,7 +518,7 @@ export function Workspace() {
     }
   }
 
-  async function acceptInvitation(invitation: EmailInvitation) {
+  async function acceptInvitation(invitation: TopicInvitation) {
     if (!user) return;
     setWorking(true);
     setError("");

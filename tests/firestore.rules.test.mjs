@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { after, before, beforeEach, test } from "node:test";
 import { initializeTestEnvironment, assertFails, assertSucceeds } from "@firebase/rules-unit-testing";
-import { collection, collectionGroup, doc, getDoc, getDocs, query, setDoc, Timestamp, updateDoc, where, writeBatch } from "firebase/firestore";
+import { collection, collectionGroup, doc, getDoc, getDocs, query, runTransaction, setDoc, Timestamp, updateDoc, where, writeBatch } from "firebase/firestore";
 
 const projectId = "tipstash-imcleverly";
 const topic = (ownerId, extra = {}) => ({
@@ -47,15 +47,97 @@ test("new topics are private by default and stay hidden from other accounts", as
 test("username reads are exact-get only and user email stays private", async () => {
   await env.withSecurityRulesDisabled(async (context) => {
     const db = context.firestore();
-    await setDoc(doc(db, "usernames/maple_road"), { uid: "person-1", username: "maple_road", displayName: "Maple", avatarUrl: "" });
+    await setDoc(doc(db, "usernames/maple_road"), { username: "maple_road", displayName: "Maple", avatarUrl: "" });
     await setDoc(doc(db, "users/person-1"), { uid: "person-1", email: "private@example.com", username: "maple_road" });
   });
   const lookup = env.authenticatedContext("lookup-user").firestore();
   const other = env.authenticatedContext("other-user").firestore();
-  assert.equal((await getDoc(doc(lookup, "usernames/maple_road"))).data().displayName, "Maple");
+  const publicProfile = (await getDoc(doc(lookup, "usernames/maple_road"))).data();
+  assert.deepEqual(Object.keys(publicProfile).sort(), ["avatarUrl", "displayName", "username"]);
+  assert.equal(publicProfile.displayName, "Maple");
   await assertFails(getDocs(collection(lookup, "usernames")));
   await assertFails(getDoc(doc(other, "users/person-1")));
   await assertFails(getDocs(collection(other, "users")));
+});
+
+test("username profiles can be created and renamed transactionally without exposing account ids", async () => {
+  const owner = env.authenticatedContext("profile-owner", { email: "owner@example.com" }).firestore();
+  const other = env.authenticatedContext("profile-other").firestore();
+  const userRef = doc(owner, "users/profile-owner");
+  const originalUsernameRef = doc(owner, "usernames/maple_road");
+
+  await assertSucceeds(runTransaction(owner, async (transaction) => {
+    const [usernameSnapshot, profileSnapshot] = await Promise.all([
+      transaction.get(originalUsernameRef),
+      transaction.get(userRef),
+    ]);
+    assert.equal(usernameSnapshot.exists(), false);
+    assert.equal(profileSnapshot.exists(), false);
+    transaction.set(originalUsernameRef, {
+      username: "maple_road",
+      displayName: "Maple",
+      avatarUrl: "https://example.com/avatar.png",
+      createdAt: Timestamp.now(),
+      updatedAt: Timestamp.now(),
+    });
+    transaction.set(userRef, {
+      uid: "profile-owner",
+      email: "owner@example.com",
+      username: "maple_road",
+      displayName: "Maple",
+      avatarUrl: "https://example.com/avatar.png",
+      createdAt: Timestamp.now(),
+      updatedAt: Timestamp.now(),
+    });
+  }));
+
+  const publicProfile = (await getDoc(doc(other, "usernames/maple_road"))).data();
+  assert.deepEqual(Object.keys(publicProfile).sort(), ["avatarUrl", "createdAt", "displayName", "updatedAt", "username"]);
+  assert.equal(publicProfile.displayName, "Maple");
+  assert.equal((await getDoc(doc(owner, "users/profile-owner"))).data().email, "owner@example.com");
+  await assertFails(getDoc(doc(other, "users/profile-owner")));
+
+  const renamedUsernameRef = doc(owner, "usernames/maple-grove");
+  await assertSucceeds(runTransaction(owner, async (transaction) => {
+    const [newUsernameSnapshot, profileSnapshot] = await Promise.all([
+      transaction.get(renamedUsernameRef),
+      transaction.get(userRef),
+    ]);
+    assert.equal(newUsernameSnapshot.exists(), false);
+    assert.equal(profileSnapshot.data().username, "maple_road");
+    transaction.delete(originalUsernameRef);
+    transaction.set(renamedUsernameRef, {
+      username: "maple-grove",
+      displayName: "Maple Grove",
+      avatarUrl: "https://example.com/avatar.png",
+      createdAt: Timestamp.now(),
+      updatedAt: Timestamp.now(),
+    });
+    transaction.set(userRef, {
+      ...profileSnapshot.data(),
+      username: "maple-grove",
+      displayName: "Maple Grove",
+      updatedAt: Timestamp.now(),
+    });
+  }));
+
+  assert.equal((await getDoc(doc(other, "usernames/maple_road"))).exists(), false);
+  assert.equal((await getDoc(doc(other, "usernames/maple-grove"))).data().displayName, "Maple Grove");
+
+  const attacker = env.authenticatedContext("profile-attacker", { email: "attacker@example.com" }).firestore();
+  await assertFails(runTransaction(attacker, async (transaction) => {
+    const occupiedUsernameRef = doc(attacker, "usernames/maple-grove");
+    const attackerProfileRef = doc(attacker, "users/profile-attacker");
+    await Promise.all([transaction.get(occupiedUsernameRef), transaction.get(attackerProfileRef)]);
+    transaction.set(occupiedUsernameRef, { username: "maple-grove", displayName: "Attacker", avatarUrl: "" });
+    transaction.set(attackerProfileRef, {
+      uid: "profile-attacker",
+      email: "attacker@example.com",
+      username: "maple-grove",
+      displayName: "Attacker",
+      avatarUrl: "",
+    });
+  }));
 });
 
 test("viewer can read inherited topic tips while editors can add and change tips", async () => {
@@ -111,6 +193,56 @@ test("verified email invitations can be claimed once by the matching account", a
   batch.update(doc(invitee, "invitations/invite-a"), { status: "accepted", acceptedBy: "reader-1", acceptedAt: Timestamp.now() });
   await assertSucceeds(batch.commit());
   await assertSucceeds(getDoc(doc(invitee, "topics/topic-invite")));
+});
+
+test("username invitations expose no account id and can only be claimed by the named user", async () => {
+  await env.withSecurityRulesDisabled(async (context) => {
+    const db = context.firestore();
+    await setDoc(doc(db, "topics/topic-username-invite"), topic("owner-1"));
+    await setDoc(doc(db, "users/owner-1"), { uid: "owner-1", email: "owner@example.com", username: "ownername" });
+    await setDoc(doc(db, "users/person-1"), { uid: "person-1", email: "private@example.com", username: "maple_road" });
+    await setDoc(doc(db, "usernames/ownername"), { username: "ownername", displayName: "Owner", avatarUrl: "" });
+    await setDoc(doc(db, "usernames/maple_road"), { username: "maple_road", displayName: "Maple", avatarUrl: "" });
+  });
+  const owner = env.authenticatedContext("owner-1").firestore();
+  await assertSucceeds(setDoc(doc(owner, "invitations/username-invite"), {
+    topicId: "topic-username-invite",
+    inviterUid: "owner-1",
+    inviteeUsername: "maple_road",
+    role: "editor",
+    status: "pending",
+    createdAt: Timestamp.now(),
+  }));
+
+  const invitee = env.authenticatedContext("person-1", { email: "private@example.com", email_verified: false }).firestore();
+  const stranger = env.authenticatedContext("other-user").firestore();
+  const received = await getDocs(query(
+    collection(invitee, "invitations"),
+    where("inviteeUsername", "==", "maple_road"),
+    where("status", "==", "pending"),
+  ));
+  assert.equal(received.size, 1);
+  await assertFails(getDoc(doc(stranger, "invitations/username-invite")));
+  await assertFails(getDocs(query(
+    collection(stranger, "invitations"),
+    where("inviteeUsername", "==", "maple_road"),
+    where("status", "==", "pending"),
+  )));
+
+  const batch = writeBatch(invitee);
+  batch.set(doc(invitee, "topics/topic-username-invite/members/person-1"), {
+    uid: "person-1",
+    role: "editor",
+    invitationId: "username-invite",
+    addedAt: Timestamp.now(),
+  });
+  batch.update(doc(invitee, "invitations/username-invite"), {
+    status: "accepted",
+    acceptedBy: "person-1",
+    acceptedAt: Timestamp.now(),
+  });
+  await assertSucceeds(batch.commit());
+  await assertSucceeds(getDoc(doc(invitee, "topics/topic-username-invite")));
 });
 
 test("unlisted topics are readable through an active link and stop after revocation", async () => {
