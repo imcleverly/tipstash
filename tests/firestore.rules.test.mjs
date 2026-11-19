@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { after, before, beforeEach, test } from "node:test";
 import { initializeTestEnvironment, assertFails, assertSucceeds } from "@firebase/rules-unit-testing";
-import { collection, collectionGroup, doc, getDoc, getDocs, query, runTransaction, setDoc, Timestamp, updateDoc, where, writeBatch } from "firebase/firestore";
+import { collection, collectionGroup, deleteDoc, doc, getDoc, getDocs, query, runTransaction, setDoc, Timestamp, updateDoc, where, writeBatch } from "firebase/firestore";
 
 const projectId = "tipstash-imcleverly";
 const topic = (ownerId, extra = {}) => ({
@@ -27,7 +27,19 @@ before(async () => {
   });
 });
 
-beforeEach(async () => env.clearFirestore());
+const alreadyApprovedUsers = [
+  "owner-1", "stranger-1", "lookup-user", "other-user", "profile-owner", "profile-other",
+  "profile-attacker", "viewer-1", "editor-1", "reader-1", "wrong-1", "unverified-1", "person-1", "approved-link",
+];
+
+beforeEach(async () => {
+  await env.clearFirestore();
+  await env.withSecurityRulesDisabled(async (context) => {
+    await Promise.all(alreadyApprovedUsers.map((uid) => setDoc(doc(context.firestore(), "accessRequests", uid), {
+      uid, email: `${uid}@example.com`, displayName: uid, avatarUrl: null, status: "approved", createdAt: Timestamp.now(),
+    })));
+  });
+});
 after(async () => env?.cleanup());
 
 test("new topics are private by default and stay hidden from other accounts", async () => {
@@ -42,6 +54,47 @@ test("new topics are private by default and stay hidden from other accounts", as
   await assertFails(setDoc(doc(owner, "topics/public-by-default"), topic("owner-1", { visibility: "unlisted", publicShareId: "share-1" })));
   await assertFails(getDocs(collection(stranger, "topics")));
   await assertSucceeds(getDocs(query(collection(owner, "topics"), where("ownerId", "==", "owner-1"))));
+});
+
+test("pending accounts can request approval but cannot use the library or approve themselves", async () => {
+  const pending = env.authenticatedContext("pending-1", { email: "pending@example.com", email_verified: true }).firestore();
+  const accessRequest = doc(pending, "accessRequests/pending-1");
+  await assertSucceeds(setDoc(accessRequest, {
+    uid: "pending-1", email: "pending@example.com", displayName: "Pending User", avatarUrl: null,
+    status: "pending", createdAt: Timestamp.now(),
+  }));
+  await assertSucceeds(getDoc(accessRequest));
+  await assertFails(updateDoc(accessRequest, { status: "approved", approvedBy: "pending-1", approvedAt: Timestamp.now() }));
+  await assertFails(setDoc(doc(pending, "topics/self-approved"), topic("pending-1")));
+  await assertFails(getDocs(collection(pending, "topics")));
+  await assertFails(getDocs(collection(pending, "invitations")));
+  await assertFails(setDoc(doc(pending, "topics/topic-a/members/pending-1"), { uid: "pending-1", role: "viewer" }));
+  await assertFails(getDocs(collection(pending, "accessRequests")));
+});
+
+test("verified global admin can approve accounts and manage topics across owners", async () => {
+  await env.withSecurityRulesDisabled(async (context) => {
+    const db = context.firestore();
+    await setDoc(doc(db, "topics/admin-target"), topic("another-owner"));
+    await setDoc(doc(db, "accessRequests/pending-2"), {
+      uid: "pending-2", email: "pending2@example.com", displayName: "Needs approval", avatarUrl: null,
+      status: "pending", createdAt: Timestamp.now(),
+    });
+  });
+  const admin = env.authenticatedContext("admin-1", {
+    email: "tuananhdao.dev.js@gmail.com", email_verified: true,
+  }).firestore();
+  await assertSucceeds(getDocs(collection(admin, "topics")));
+  await assertSucceeds(updateDoc(doc(admin, "topics/admin-target"), { title: "Updated by admin" }));
+  await assertSucceeds(updateDoc(doc(admin, "accessRequests/pending-2"), {
+    status: "approved", approvedBy: "admin-1", approvedAt: Timestamp.now(),
+  }));
+  const approved = env.authenticatedContext("pending-2", { email: "pending2@example.com", email_verified: true }).firestore();
+  await assertFails(getDoc(doc(approved, "topics/admin-target")));
+  await assertSucceeds(setDoc(doc(approved, "topics/approved-topic"), topic("pending-2")));
+  await assertFails(updateDoc(doc(approved, "accessRequests/pending-2"), { status: "pending" }));
+  await assertSucceeds(setDoc(doc(admin, "topics/admin-created"), topic("admin-1")));
+  await assertSucceeds(deleteDoc(doc(admin, "topics/admin-target")));
 });
 
 test("username reads are exact-get only and user email stays private", async () => {
@@ -250,7 +303,7 @@ test("unlisted topics are readable through an active link and stop after revocat
     const db = context.firestore();
     await setDoc(doc(db, "topics/topic-public"), topic("owner-1", { visibility: "unlisted", publicShareId: "share-a" }));
     await setDoc(doc(db, "topics/topic-public/tips/tip-a"), { title: "Public tip", summary: "", blocks: [], position: 0, createdBy: "owner-1", createdAt: Timestamp.now(), updatedAt: Timestamp.now() });
-    await setDoc(doc(db, "publicShares/share-a"), { topicId: "topic-public", ownerUid: "owner-1", active: true, createdAt: Timestamp.now() });
+    await setDoc(doc(db, "publicShares/share-a"), { topicId: "topic-public", ownerUid: "owner-1", active: true, audience: "anyone", createdAt: Timestamp.now() });
   });
   const visitor = env.unauthenticatedContext().firestore();
   const owner = env.authenticatedContext("owner-1").firestore();
@@ -261,4 +314,43 @@ test("unlisted topics are readable through an active link and stop after revocat
   await assertFails(getDoc(doc(visitor, "publicShares/share-a")));
   await assertFails(getDoc(doc(visitor, "topics/topic-public")));
   await assertFails(getDoc(doc(visitor, "topics/topic-public/tips/tip-a")));
+});
+
+test("approved-only links require an approved account and do not require topic membership", async () => {
+  await env.withSecurityRulesDisabled(async (context) => {
+    const db = context.firestore();
+    await setDoc(doc(db, "topics/topic-approved-only"), topic("owner-1", { visibility: "unlisted", publicShareId: "share-approved" }));
+    await setDoc(doc(db, "topics/topic-approved-only/tips/tip-a"), { title: "Restricted tip", summary: "", blocks: [], position: 0, createdBy: "owner-1", createdAt: Timestamp.now(), updatedAt: Timestamp.now() });
+    await setDoc(doc(db, "publicShares/share-approved"), {
+      topicId: "topic-approved-only", ownerUid: "owner-1", active: true, audience: "approvedUsers", createdAt: Timestamp.now(),
+    });
+    await setDoc(doc(db, "accessRequests/pending-link"), {
+      uid: "pending-link", email: "pending-link@example.com", displayName: "Pending", avatarUrl: null,
+      status: "pending", createdAt: Timestamp.now(),
+    });
+  });
+  const visitor = env.unauthenticatedContext().firestore();
+  const pending = env.authenticatedContext("pending-link", { email: "pending-link@example.com", email_verified: true }).firestore();
+  const approved = env.authenticatedContext("approved-link", { email: "approved-link@example.com", email_verified: true }).firestore();
+  await assertFails(getDoc(doc(visitor, "publicShares/share-approved")));
+  await assertFails(getDoc(doc(visitor, "topics/topic-approved-only")));
+  await assertFails(getDoc(doc(pending, "publicShares/share-approved")));
+  await assertFails(getDoc(doc(pending, "topics/topic-approved-only/tips/tip-a")));
+  await assertSucceeds(getDoc(doc(approved, "publicShares/share-approved")));
+  await assertSucceeds(getDoc(doc(approved, "topics/topic-approved-only")));
+  await assertSucceeds(getDoc(doc(approved, "topics/topic-approved-only/tips/tip-a")));
+  await assertFails(updateDoc(doc(approved, "topics/topic-approved-only"), { title: "Read only" }));
+});
+
+test("legacy share records without an audience remain anonymous and revocation blocks access", async () => {
+  await env.withSecurityRulesDisabled(async (context) => {
+    const db = context.firestore();
+    await setDoc(doc(db, "topics/topic-legacy"), topic("owner-1", { visibility: "unlisted", publicShareId: "share-legacy" }));
+    await setDoc(doc(db, "publicShares/share-legacy"), { topicId: "topic-legacy", ownerUid: "owner-1", active: true, createdAt: Timestamp.now() });
+  });
+  const visitor = env.unauthenticatedContext().firestore();
+  const owner = env.authenticatedContext("owner-1").firestore();
+  await assertSucceeds(getDoc(doc(visitor, "topics/topic-legacy")));
+  await assertSucceeds(updateDoc(doc(owner, "publicShares/share-legacy"), { active: false, revokedAt: Timestamp.now() }));
+  await assertFails(getDoc(doc(visitor, "topics/topic-legacy")));
 });

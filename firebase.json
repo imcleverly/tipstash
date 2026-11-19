@@ -1,4 +1,16 @@
 {
+  "auth": {
+    "providers": {
+      "googleSignIn": {
+        "oAuthBrandDisplayName": "Tipstash",
+        "supportEmail": "tuananhdao.dev.js@gmail.com",
+        "authorizedRedirectUris": [
+          "https://tipstash.vercel.app",
+          "http://localhost:3000"
+        ]
+      }
+    }
+  },
   "firestore": {
     "database": "(default)",
     "location": "asia-southeast1",

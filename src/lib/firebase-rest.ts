@@ -49,3 +49,14 @@ export function restFieldString(value: unknown): string {
   if (!value || typeof value !== "object") return "";
   return String((value as { stringValue?: unknown }).stringValue ?? "");
 }
+
+export async function isApprovedFirebaseUser(user: VerifiedFirebaseUser, idToken: string): Promise<boolean> {
+  if (user.emailVerified && user.email === "tuananhdao.dev.js@gmail.com") return true;
+  const response = await fetch(firestoreUrl(`accessRequests/${encodeURIComponent(user.uid)}`), {
+    headers: firestoreBearer(idToken),
+    cache: "no-store",
+  });
+  if (!response.ok) return false;
+  const request = await response.json() as { fields?: Record<string, unknown> };
+  return restFieldString(request.fields?.status) === "approved";
+}

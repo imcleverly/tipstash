@@ -16,7 +16,21 @@ before(async () => {
   });
 });
 
-beforeEach(async () => env.clearFirestore());
+beforeEach(async () => {
+  await env.clearFirestore();
+  await env.withSecurityRulesDisabled(async (context) => {
+    const db = context.firestore();
+    for (const uid of ["owner-1", "viewer-1", "editor-1", "approved-file-reader"]) {
+      await setDoc(doc(db, `accessRequests/${uid}`), {
+        uid, email: `${uid}@example.com`, displayName: uid, avatarUrl: null, status: "approved", createdAt: Timestamp.now(),
+      });
+    }
+    await setDoc(doc(db, "accessRequests/pending-file-reader"), {
+      uid: "pending-file-reader", email: "pending@example.com", displayName: "Pending", avatarUrl: null,
+      status: "pending", createdAt: Timestamp.now(),
+    });
+  });
+});
 after(async () => env?.cleanup());
 
 async function seedTopic(extra = {}) {
@@ -67,7 +81,7 @@ test("editors can upload while unshared accounts cannot access topic files", asy
 test("public file access follows the share state and ends after revocation", async () => {
   await seedTopic({ visibility: "unlisted", publicShareId: "share-files" });
   await env.withSecurityRulesDisabled(async (context) => {
-    await setDoc(doc(context.firestore(), "publicShares/share-files"), { topicId: "topic-files", ownerUid: "owner-1", active: true, createdAt: Timestamp.now() });
+    await setDoc(doc(context.firestore(), "publicShares/share-files"), { topicId: "topic-files", ownerUid: "owner-1", active: true, audience: "anyone", createdAt: Timestamp.now() });
     await uploadBytes(ref(context.storage(), "topics/topic-files/files/public.png"), new Uint8Array([2, 3]), { contentType: "image/png" });
   });
   const visitor = env.unauthenticatedContext().storage();
@@ -75,4 +89,36 @@ test("public file access follows the share state and ends after revocation", asy
   const owner = env.authenticatedContext("owner-1").firestore();
   await assertSucceeds(updateDoc(doc(owner, "publicShares/share-files"), { active: false, revokedAt: Timestamp.now() }));
   await assertFails(getBytes(ref(visitor, "topics/topic-files/files/public.png")));
+});
+
+test("pending accounts cannot read files and the verified admin can manage every topic file", async () => {
+  await seedTopic();
+  await env.withSecurityRulesDisabled(async (context) => {
+    await uploadBytes(ref(context.storage(), "topics/topic-files/files/private.png"), new Uint8Array([4, 5]), { contentType: "image/png" });
+  });
+  const pending = env.authenticatedContext("pending-file-reader", { email: "pending@example.com", email_verified: true }).storage();
+  await assertFails(getBytes(ref(pending, "topics/topic-files/files/private.png")));
+  const admin = env.authenticatedContext("admin-1", { email: "tuananhdao.dev.js@gmail.com", email_verified: true }).storage();
+  await assertSucceeds(getBytes(ref(admin, "topics/topic-files/files/private.png")));
+  await assertSucceeds(uploadBytes(ref(admin, "topics/topic-files/files/admin.png"), new Uint8Array([6]), { contentType: "image/png" }));
+});
+
+test("approved-only links allow approved accounts without membership and deny visitors and pending accounts", async () => {
+  await seedTopic({ visibility: "unlisted", publicShareId: "share-restricted" });
+  await env.withSecurityRulesDisabled(async (context) => {
+    const db = context.firestore();
+    await setDoc(doc(db, "publicShares/share-restricted"), {
+      topicId: "topic-files", ownerUid: "owner-1", active: true, audience: "approvedUsers", createdAt: Timestamp.now(),
+    });
+    await uploadBytes(ref(context.storage(), "topics/topic-files/files/restricted.png"), new Uint8Array([7]), { contentType: "image/png" });
+  });
+  const visitor = env.unauthenticatedContext().storage();
+  const pending = env.authenticatedContext("pending-file-reader", { email: "pending@example.com", email_verified: true }).storage();
+  const approved = env.authenticatedContext("approved-file-reader", { email: "reader@example.com", email_verified: true }).storage();
+  await assertFails(getBytes(ref(visitor, "topics/topic-files/files/restricted.png")));
+  await assertFails(getBytes(ref(pending, "topics/topic-files/files/restricted.png")));
+  await assertSucceeds(getBytes(ref(approved, "topics/topic-files/files/restricted.png")));
+  const owner = env.authenticatedContext("owner-1").firestore();
+  await assertSucceeds(updateDoc(doc(owner, "publicShares/share-restricted"), { active: false, revokedAt: Timestamp.now() }));
+  await assertFails(getBytes(ref(approved, "topics/topic-files/files/restricted.png")));
 });

@@ -2,10 +2,13 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
+import { GoogleAuthProvider, onAuthStateChanged, signInWithPopup, signOut, type User } from "firebase/auth";
+import { doc, runTransaction, serverTimestamp } from "firebase/firestore";
 import { getBlob, ref } from "firebase/storage";
 import { storage } from "@/lib/firebase/client";
 import { AssetPreview } from "@/components/asset-preview";
 import { Icon } from "@/components/icons";
+import { auth, db } from "@/lib/firebase/client";
 import { messages } from "@/lib/i18n";
 import type { Locale, Tip, TipBlock, Topic } from "@/lib/types";
 
@@ -46,21 +49,77 @@ export function PublicTopicPage({ shareId }: { shareId: string }) {
   const [locale, setLocale] = useState<Locale>("vi");
   const t = messages(locale);
   const [data, setData] = useState<{ topic: Topic; tips: Tip[] } | null>(null);
+  const [user, setUser] = useState<User | null>(null);
+  const [authReady, setAuthReady] = useState(false);
   const [loading, setLoading] = useState(true);
   const [unavailable, setUnavailable] = useState(false);
+  const [accessIssue, setAccessIssue] = useState<"sign-in-required" | "approval-required" | null>(null);
+  const [refreshKey, setRefreshKey] = useState(0);
+
+  useEffect(() => onAuthStateChanged(auth, (nextUser) => {
+    setUser(nextUser);
+    setAuthReady(true);
+  }), []);
 
   useEffect(() => {
+    if (!authReady) return;
     let current = true;
-    fetch(`/api/public/${encodeURIComponent(shareId)}`, { cache: "no-store" })
-      .then(async (response) => response.ok ? response.json() : Promise.reject())
-      .then((value) => current && setData(value as { topic: Topic; tips: Tip[] }))
-      .catch(() => current && setUnavailable(true))
-      .finally(() => current && setLoading(false));
+    async function loadShare() {
+      setLoading(true);
+      setUnavailable(false);
+      setAccessIssue(null);
+      try {
+        if (user?.emailVerified && user.email?.trim().toLowerCase() !== "tuananhdao.dev.js@gmail.com") {
+          const accessRef = doc(db, "accessRequests", user.uid);
+          await runTransaction(db, async (transaction) => {
+            const currentAccess = await transaction.get(accessRef);
+            if (!currentAccess.exists()) transaction.set(accessRef, {
+              uid: user.uid,
+              email: user.email,
+              displayName: user.displayName ?? "",
+              avatarUrl: user.photoURL,
+              status: "pending",
+              createdAt: serverTimestamp(),
+            });
+          });
+        }
+        const headers = new Headers();
+        if (user) headers.set("authorization", `Bearer ${await user.getIdToken()}`);
+        const response = await fetch(`/api/public/${encodeURIComponent(shareId)}`, { headers, cache: "no-store" });
+        const value = await response.json() as { error?: string; reason?: string; topic?: Topic; tips?: Tip[] };
+        if (!response.ok) {
+          if (response.status === 401 || response.status === 403) {
+            if (current) setAccessIssue(value.reason === "sign-in-required" || response.status === 401 ? "sign-in-required" : "approval-required");
+            return;
+          }
+          throw new Error(value.error || t.publicUnavailable);
+        }
+        if (current) setData(value as { topic: Topic; tips: Tip[] });
+      } catch {
+        if (current) setUnavailable(true);
+      } finally {
+        if (current) setLoading(false);
+      }
+    }
+    void loadShare();
     return () => { current = false; };
-  }, [shareId]);
+  }, [shareId, authReady, user, refreshKey, t.publicUnavailable]);
+
+  async function handleSignIn() {
+    try {
+      const provider = new GoogleAuthProvider();
+      provider.setCustomParameters({ prompt: "select_account" });
+      await signInWithPopup(auth, provider);
+    } catch {
+      setAccessIssue("sign-in-required");
+    }
+  }
 
   if (loading) return <main className="public-state"><span className="loading-mark"/><p>{t.loading}</p></main>;
-  if (unavailable || !data) return <main className="public-state"><div className="public-state-card"><span className="state-icon"><Icon name="lock" size={23}/></span><h1>{t.publicUnavailable}</h1><p>{t.app} · {t.viewOnly}</p><button className="language-toggle" onClick={() => setLocale(locale === "vi" ? "en" : "vi")}>{locale === "vi" ? "EN" : "VI"}</button></div></main>;
+  if (accessIssue || unavailable || !data) return <main className="public-state"><div className="public-state-card"><span className="state-icon"><Icon name="lock" size={23}/></span><h1>{accessIssue ? t.restrictedShareTitle : t.publicUnavailable}</h1><p>{accessIssue ? t.restrictedShareBody : `${t.app} · ${t.viewOnly}`}</p>
+    {accessIssue === "sign-in-required" && <button className="primary-button google-button" onClick={() => void handleSignIn()}><Icon name="google" size={17}/>{t.signIn}<Icon name="arrow" size={16}/></button>}
+    {accessIssue === "approval-required" && <div className="restricted-actions"><button className="secondary-button" onClick={() => setRefreshKey((value) => value + 1)}>{t.approvalCheck}</button>{user && <button className="text-button" onClick={() => void signOut(auth)}>{t.signOut}</button>}</div>}
+    <button className="language-toggle" onClick={() => setLocale(locale === "vi" ? "en" : "vi")}>{locale === "vi" ? "EN" : "VI"}</button></div></main>;
 
   return <main className="public-page">
     <header className="public-bar">

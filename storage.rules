@@ -2,45 +2,64 @@ rules_version = '2';
 
 service firebase.storage {
   match /b/{bucket}/o {
+    function isAdmin() {
+      return request.auth != null
+        && request.auth.token.get('email_verified', false) == true
+        && request.auth.token.get('email', '') is string
+        && request.auth.token.get('email', '').lower() == 'tuananhdao.dev.js@gmail.com';
+    }
+
+    function isApproved() {
+      return isAdmin()
+        || (request.auth != null
+          && firestore.exists(/databases/(default)/documents/accessRequests/$(request.auth.uid))
+          && firestore.get(/databases/(default)/documents/accessRequests/$(request.auth.uid)).data.status == 'approved');
+    }
+
     function isTopicOwner(topicId) {
-      let path = /databases/(default)/documents/topics/$(topicId);
-      return request.auth != null && firestore.exists(path)
-        ? firestore.get(path).data.ownerId == request.auth.uid
-        : false;
+      return request.auth != null
+        && firestore.exists(/databases/(default)/documents/topics/$(topicId))
+        && firestore.get(/databases/(default)/documents/topics/$(topicId)).data.ownerId == request.auth.uid;
     }
 
     function hasEditorRole(topicId) {
       return request.auth != null
-        ? (firestore.exists(/databases/(default)/documents/topics/$(topicId)/members/$(request.auth.uid))
-          ? firestore.get(/databases/(default)/documents/topics/$(topicId)/members/$(request.auth.uid)).data.role == 'editor'
-          : false)
-        : false;
+        && firestore.exists(/databases/(default)/documents/topics/$(topicId)/members/$(request.auth.uid))
+        && firestore.get(/databases/(default)/documents/topics/$(topicId)/members/$(request.auth.uid)).data.role == 'editor';
     }
 
     function canViewTopic(topicId) {
-      return isTopicOwner(topicId)
-        ? true
-        : request.auth != null
-          ? (firestore.exists(/databases/(default)/documents/topics/$(topicId)/members/$(request.auth.uid))
-            ? firestore.get(/databases/(default)/documents/topics/$(topicId)/members/$(request.auth.uid)).data.role in ['viewer', 'editor']
-            : false)
-          : false;
+      return isAdmin()
+        || (isApproved()
+          && (isTopicOwner(topicId)
+            || (request.auth != null
+              && firestore.exists(/databases/(default)/documents/topics/$(topicId)/members/$(request.auth.uid))
+              && firestore.get(/databases/(default)/documents/topics/$(topicId)/members/$(request.auth.uid)).data.role in ['viewer', 'editor'])));
+    }
+
+    function shareAudienceAllows(share) {
+      return share.get('audience', 'anyone') == 'anyone'
+        || (share.get('audience', 'anyone') == 'approvedUsers'
+          && request.auth != null
+          && request.auth.token.get('email_verified', false) == true
+          && isApproved());
+    }
+
+    function hasActiveShare(topicId, shareId) {
+      return shareId is string
+        && firestore.exists(/databases/(default)/documents/publicShares/$(shareId))
+        && firestore.get(/databases/(default)/documents/publicShares/$(shareId)).data.get('topicId', '') == topicId
+        && firestore.get(/databases/(default)/documents/publicShares/$(shareId)).data.get('active', false) == true
+        && shareAudienceAllows(firestore.get(/databases/(default)/documents/publicShares/$(shareId)).data);
     }
 
     function hasActivePublicLink(topicId) {
-      let topicPath = /databases/(default)/documents/topics/$(topicId);
-      return firestore.exists(topicPath)
-        ? (firestore.get(topicPath).data.publicShareId is string
-          ? (firestore.exists(/databases/(default)/documents/publicShares/$(firestore.get(topicPath).data.publicShareId))
-            ? firestore.get(/databases/(default)/documents/publicShares/$(firestore.get(topicPath).data.publicShareId)).data.get('topicId', '') == topicId
-              && firestore.get(/databases/(default)/documents/publicShares/$(firestore.get(topicPath).data.publicShareId)).data.get('active', false) == true
-            : false)
-          : false)
-        : false;
+      return firestore.exists(/databases/(default)/documents/topics/$(topicId))
+        && hasActiveShare(topicId, firestore.get(/databases/(default)/documents/topics/$(topicId)).data.get('publicShareId', null));
     }
 
     function canEditTopic(topicId) {
-      return isTopicOwner(topicId) || hasEditorRole(topicId);
+      return isAdmin() || (isApproved() && (isTopicOwner(topicId) || hasEditorRole(topicId)));
     }
 
     function supportedFileType(contentType) {

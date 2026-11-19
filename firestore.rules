@@ -8,12 +8,28 @@ service cloud.firestore {
 
     function hasVerifiedEmail() {
       return signedIn()
-        && request.auth.token.email_verified == true
-        && request.auth.token.email is string;
+        && request.auth.token.get('email_verified', false) == true
+        && request.auth.token.get('email', '') is string;
+    }
+
+    function isAdmin() {
+      return hasVerifiedEmail()
+        && request.auth.token.get('email', '').lower() == 'tuananhdao.dev.js@gmail.com';
+    }
+
+    function accessRequestPath(uid) {
+      return /databases/$(database)/documents/accessRequests/$(uid);
+    }
+
+    function isApproved() {
+      return isAdmin()
+        || (signedIn()
+          && exists(accessRequestPath(request.auth.uid))
+          && get(accessRequestPath(request.auth.uid)).data.status == 'approved');
     }
 
     function emailHash() {
-      return hashing.sha256(request.auth.token.email.lower().toUtf8()).toHexString().lower();
+      return hashing.sha256(request.auth.token.get('email', '').lower().toUtf8()).toHexString().lower();
     }
 
     function topicPath(topicId) {
@@ -34,8 +50,7 @@ service cloud.firestore {
 
     function isTopicOwner(topicId) {
       return signedIn() && exists(topicPath(topicId))
-        ? get(topicPath(topicId)).data.ownerId == request.auth.uid
-        : false;
+        && get(topicPath(topicId)).data.ownerId == request.auth.uid;
     }
 
     function hasTopicMembership(topicId) {
@@ -49,69 +64,103 @@ service cloud.firestore {
     }
 
     function canViewTopic(topicId) {
-      return signedIn()
-        ? (isTopicOwner(topicId)
-          ? true
-          : topicMemberRole(topicId, request.auth.uid) in ['viewer', 'editor'])
-        : false;
+      return isAdmin()
+        || (isApproved()
+          && (isTopicOwner(topicId)
+            || topicMemberRole(topicId, request.auth.uid) in ['viewer', 'editor']));
     }
 
     function canEditTopic(topicId) {
-      return isTopicOwner(topicId)
-        || (hasTopicMembership(topicId)
-          && get(memberPath(topicId, request.auth.uid)).data.role == 'editor');
+      return isAdmin()
+        || (isApproved()
+          && (isTopicOwner(topicId)
+            || (hasTopicMembership(topicId)
+              && get(memberPath(topicId, request.auth.uid)).data.role == 'editor')));
     }
 
-    function activePublicShare(topicId, shareId) {
+    function shareAudienceAllows(share) {
+      return share.get('audience', 'anyone') == 'anyone'
+        || (share.get('audience', 'anyone') == 'approvedUsers'
+          && hasVerifiedEmail()
+          && isApproved());
+    }
+
+    function activeShare(topicId, shareId) {
       return shareId is string
-        ? (exists(/databases/$(database)/documents/publicShares/$(shareId))
-          ? get(/databases/$(database)/documents/publicShares/$(shareId)).data.active == true
-            && get(/databases/$(database)/documents/publicShares/$(shareId)).data.topicId == topicId
-          : false)
-        : false;
+        && exists(/databases/$(database)/documents/publicShares/$(shareId))
+        && get(/databases/$(database)/documents/publicShares/$(shareId)).data.active == true
+        && get(/databases/$(database)/documents/publicShares/$(shareId)).data.topicId == topicId
+        && shareAudienceAllows(get(/databases/$(database)/documents/publicShares/$(shareId)).data);
     }
 
     function activeTopicShare(topicId) {
       return exists(topicPath(topicId))
-        ? activePublicShare(topicId, get(topicPath(topicId)).data.get('publicShareId', null))
-        : false;
+        && activeShare(topicId, get(topicPath(topicId)).data.get('publicShareId', null));
     }
 
     function isInvitee(invitation) {
-      return (hasVerifiedEmail()
-          && invitation.get('inviteeEmailHash', '') == emailHash())
-        || (signedIn()
-          && invitation.get('inviteeUsername', '') is string
-          && exists(userPath(request.auth.uid))
-          && get(userPath(request.auth.uid)).data.username == invitation.inviteeUsername);
+      return hasVerifiedEmail()
+          && invitation.get('inviteeEmailHash', '') == emailHash()
+          || (signedIn()
+            && invitation.get('inviteeUsername', '') is string
+            && exists(userPath(request.auth.uid))
+            && get(userPath(request.auth.uid)).data.username == invitation.inviteeUsername);
+    }
+
+    match /accessRequests/{userId} {
+      allow get: if signedIn() && (isAdmin() || userId == request.auth.uid);
+      allow list: if isAdmin();
+
+      allow create: if hasVerifiedEmail()
+        && userId == request.auth.uid
+        && !exists(accessRequestPath(userId))
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.email == request.auth.token.get('email', '')
+        && request.resource.data.status == 'pending'
+        && request.resource.data.keys().hasAll([
+          'uid', 'email', 'displayName', 'avatarUrl', 'status', 'createdAt'
+        ])
+        && request.resource.data.keys().hasOnly([
+          'uid', 'email', 'displayName', 'avatarUrl', 'status', 'createdAt'
+        ]);
+
+      allow update: if isAdmin()
+        && resource.data.status == 'pending'
+        && request.resource.data.status == 'approved'
+        && request.resource.data.approvedBy == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'status', 'approvedBy', 'approvedAt'
+        ]);
+
+      allow delete: if false;
     }
 
     match /usernames/{username} {
-      allow get: if signedIn();
+      allow get: if isApproved();
       allow list: if false;
 
-      allow create: if signedIn()
+      allow create: if isApproved()
         && request.resource.data.username == username
         && request.resource.data.keys().hasAll(['username', 'displayName', 'avatarUrl'])
         && request.resource.data.keys().hasOnly(['username', 'displayName', 'avatarUrl', 'createdAt', 'updatedAt'])
         && !exists(usernamePath(username))
         && getAfter(userPath(request.auth.uid)).data.username == username;
 
-      allow update: if signedIn()
+      allow update: if isApproved()
         && get(userPath(request.auth.uid)).data.username == username
         && getAfter(userPath(request.auth.uid)).data.username == username
         && request.resource.data.username == username
         && request.resource.data.keys().hasOnly(['username', 'displayName', 'avatarUrl', 'createdAt', 'updatedAt']);
 
-      allow delete: if signedIn()
+      allow delete: if isApproved()
         && get(userPath(request.auth.uid)).data.username == username
         && getAfter(userPath(request.auth.uid)).data.username != username;
     }
 
     match /users/{userId} {
-      allow get: if signedIn() && userId == request.auth.uid;
+      allow get: if isApproved() && signedIn() && userId == request.auth.uid;
       allow list: if false;
-      allow create: if signedIn()
+      allow create: if isApproved()
         && userId == request.auth.uid
         && request.resource.data.uid == request.auth.uid
         && request.resource.data.email == request.auth.token.email
@@ -120,7 +169,7 @@ service cloud.firestore {
           'uid', 'email', 'username', 'displayName', 'avatarUrl', 'createdAt', 'updatedAt'
         ])
         && getAfter(usernamePath(request.resource.data.username)).data.username == request.resource.data.username;
-      allow update: if signedIn()
+      allow update: if isApproved()
         && userId == request.auth.uid
         && request.resource.data.uid == resource.data.uid
         && request.resource.data.email == resource.data.email
@@ -128,23 +177,24 @@ service cloud.firestore {
           'uid', 'email', 'username', 'displayName', 'avatarUrl', 'createdAt', 'updatedAt'
         ])
         && getAfter(usernamePath(request.resource.data.username)).data.username == request.resource.data.username;
-      allow delete: if signedIn() && userId == request.auth.uid;
+      allow delete: if isApproved() && userId == request.auth.uid;
     }
 
-    // This recursive rule lets each user query their own membership across topics.
+    // This recursive rule lets each approved user query their own memberships.
     match /{path=**}/members/{memberUid} {
-      allow get, list: if signedIn() && resource.data.uid == request.auth.uid;
+      allow get, list: if isApproved()
+        && (isAdmin() || resource.data.uid == request.auth.uid);
     }
 
     match /topics/{topicId} {
       allow get: if canViewTopic(topicId)
-        ? true
-        : activePublicShare(topicId, resource.data.get('publicShareId', null));
+        || activeShare(topicId, resource.data.get('publicShareId', null));
 
-      allow list: if signedIn()
-        && (resource.data.ownerId == request.auth.uid || hasTopicMembership(topicId));
+      allow list: if isAdmin()
+        || (isApproved()
+          && (resource.data.ownerId == request.auth.uid || hasTopicMembership(topicId)));
 
-      allow create: if signedIn()
+      allow create: if isApproved()
         && request.resource.data.ownerId == request.auth.uid
         && request.resource.data.visibility == 'private'
         && request.resource.data.publicShareId == null
@@ -157,29 +207,34 @@ service cloud.firestore {
           'publicShareId', 'createdAt', 'updatedAt'
         ]);
 
-      allow update: if canEditTopic(topicId)
-        && request.resource.data.ownerId == resource.data.ownerId
-        && request.resource.data.createdAt == resource.data.createdAt
-        && request.resource.data.keys().hasOnly([
-          'ownerId', 'title', 'description', 'coverImagePath', 'visibility',
-          'publicShareId', 'createdAt', 'updatedAt'
-        ])
-        && (
-          (isTopicOwner(topicId)
-            && request.resource.data.visibility == resource.data.visibility
-            || isTopicOwner(topicId)
-              && request.resource.data.visibility in ['private', 'unlisted'])
-          || request.resource.data.diff(resource.data).affectedKeys().hasOnly([
-            'title', 'description', 'coverImagePath', 'updatedAt'
+      allow update: if isAdmin()
+        ? request.resource.data.ownerId == resource.data.ownerId
+          && request.resource.data.createdAt == resource.data.createdAt
+          && request.resource.data.keys().hasOnly([
+            'ownerId', 'title', 'description', 'coverImagePath', 'visibility',
+            'publicShareId', 'createdAt', 'updatedAt'
           ])
-        );
+          && request.resource.data.visibility in ['private', 'unlisted']
+        : isApproved()
+          && canEditTopic(topicId)
+          && request.resource.data.ownerId == resource.data.ownerId
+          && request.resource.data.createdAt == resource.data.createdAt
+          && request.resource.data.keys().hasOnly([
+            'ownerId', 'title', 'description', 'coverImagePath', 'visibility',
+            'publicShareId', 'createdAt', 'updatedAt'
+          ])
+          && (
+            (isTopicOwner(topicId)
+              && request.resource.data.visibility in ['private', 'unlisted'])
+            || request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+              'title', 'description', 'coverImagePath', 'updatedAt'
+            ])
+          );
 
-      allow delete: if isTopicOwner(topicId);
+      allow delete: if isAdmin() || (isApproved() && isTopicOwner(topicId));
 
       match /tips/{tipId} {
-        allow get, list: if canViewTopic(topicId)
-          ? true
-          : activeTopicShare(topicId);
+        allow get, list: if canViewTopic(topicId) || activeTopicShare(topicId);
 
         allow create: if canEditTopic(topicId)
           && request.resource.data.keys().hasAll([
@@ -201,15 +256,16 @@ service cloud.firestore {
       }
 
       match /members/{memberUid} {
-        allow get, list: if signedIn()
-          && (resource.data.uid == request.auth.uid || canViewTopic(topicId));
+        allow get, list: if isAdmin()
+          || (isApproved()
+            && (resource.data.uid == request.auth.uid || canViewTopic(topicId)));
 
         allow create: if canEditTopic(topicId)
           && request.resource.data.uid == memberUid
           && request.resource.data.role in ['viewer', 'editor']
           && request.resource.data.keys().hasOnly(['uid', 'role', 'invitationId', 'addedAt']);
 
-        allow create: if signedIn()
+        allow create: if isApproved()
           && memberUid == request.auth.uid
           && request.resource.data.uid == request.auth.uid
           && request.resource.data.role in ['viewer', 'editor']
@@ -221,21 +277,22 @@ service cloud.firestore {
           && isInvitee(getAfter(/databases/$(database)/documents/invitations/$(request.resource.data.invitationId)).data)
           && getAfter(/databases/$(database)/documents/invitations/$(request.resource.data.invitationId)).data.role == request.resource.data.role;
 
-        allow update: if isTopicOwner(topicId)
+        allow update: if (isAdmin() || isTopicOwner(topicId))
           && request.resource.data.uid == memberUid
           && request.resource.data.role in ['viewer', 'editor']
           && request.resource.data.keys().hasOnly(['uid', 'role', 'invitationId', 'addedAt']);
 
-        allow delete: if isTopicOwner(topicId)
-          || (signedIn() && memberUid == request.auth.uid);
+        allow delete: if isAdmin()
+          || (isApproved() && (isTopicOwner(topicId) || memberUid == request.auth.uid));
       }
     }
 
     match /invitations/{invitationId} {
-      allow get, list: if signedIn()
-        && (resource.data.inviterUid == request.auth.uid || isInvitee(resource.data));
+      allow get, list: if isAdmin()
+        || (isApproved()
+          && (resource.data.inviterUid == request.auth.uid || isInvitee(resource.data)));
 
-      allow create: if signedIn()
+      allow create: if isApproved()
         && request.resource.data.inviterUid == request.auth.uid
         && canEditTopic(request.resource.data.topicId)
         && request.resource.data.role in ['viewer', 'editor']
@@ -261,45 +318,62 @@ service cloud.firestore {
             && exists(usernamePath(request.resource.data.inviteeUsername)))
         );
 
-      allow update: if signedIn()
-        && resource.data.status == 'pending'
-        && (
-          (resource.data.inviterUid == request.auth.uid
-            && request.resource.data.status == 'revoked'
-            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt']))
-          || (isInvitee(resource.data)
-            && request.resource.data.status == 'accepted'
-            && request.resource.data.acceptedBy == request.auth.uid
-            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'acceptedBy', 'acceptedAt'])
-            && getAfter(memberPath(resource.data.topicId, request.auth.uid)).data.invitationId == invitationId)
-        );
+      allow update: if isAdmin()
+        ? resource.data.status == 'pending'
+          && request.resource.data.status == 'revoked'
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt'])
+        : isApproved()
+          && resource.data.status == 'pending'
+          && (
+            (resource.data.inviterUid == request.auth.uid
+              && request.resource.data.status == 'revoked'
+              && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt']))
+            || (isInvitee(resource.data)
+              && request.resource.data.status == 'accepted'
+              && request.resource.data.acceptedBy == request.auth.uid
+              && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'acceptedBy', 'acceptedAt']))
+          );
 
-      allow delete: if signedIn()
-        && resource.data.inviterUid == request.auth.uid
-        && resource.data.status == 'pending';
+      allow delete: if isAdmin()
+        || (isApproved()
+          && resource.data.inviterUid == request.auth.uid
+          && resource.data.status == 'pending');
     }
 
     match /publicShares/{shareId} {
-      allow get: if resource.data.active == true
-        || (signedIn() && resource.data.ownerUid == request.auth.uid);
-      allow list: if false;
+      allow get: if isAdmin()
+        || (resource.data.active == true && shareAudienceAllows(resource.data))
+        || (isApproved() && resource.data.ownerUid == request.auth.uid);
+      allow list: if isAdmin();
 
-      allow create: if signedIn()
-        && request.resource.data.ownerUid == request.auth.uid
+      allow create: if isApproved()
         && request.resource.data.active == true
         && request.resource.data.topicId is string
-        && request.resource.data.keys().hasAll(['topicId', 'ownerUid', 'active', 'createdAt'])
-        && isTopicOwner(request.resource.data.topicId)
-        && request.resource.data.keys().hasOnly(['topicId', 'ownerUid', 'active', 'createdAt', 'revokedAt']);
+        && request.resource.data.ownerUid == get(topicPath(request.resource.data.topicId)).data.ownerId
+        && request.resource.data.audience in ['anyone', 'approvedUsers']
+        && request.resource.data.keys().hasAll(['topicId', 'ownerUid', 'active', 'audience', 'createdAt'])
+        && request.resource.data.keys().hasOnly(['topicId', 'ownerUid', 'active', 'audience', 'createdAt', 'revokedAt'])
+        && (isAdmin() || isTopicOwner(request.resource.data.topicId));
 
-      allow update: if signedIn()
-        && resource.data.ownerUid == request.auth.uid
-        && request.resource.data.ownerUid == resource.data.ownerUid
-        && resource.data.active == true
-        && request.resource.data.active == false
-        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['active', 'revokedAt']);
+      allow update: if isAdmin()
+        ? request.resource.data.ownerUid == resource.data.ownerUid
+          && request.resource.data.topicId == resource.data.topicId
+          && request.resource.data.keys().hasOnly(['topicId', 'ownerUid', 'active', 'audience', 'createdAt', 'revokedAt'])
+          && ((resource.data.active == true
+              && request.resource.data.active == true
+              && request.resource.data.audience in ['anyone', 'approvedUsers'])
+            || (resource.data.active == true && request.resource.data.active == false))
+        : isApproved()
+          && resource.data.ownerUid == request.auth.uid
+          && request.resource.data.ownerUid == resource.data.ownerUid
+          && request.resource.data.topicId == resource.data.topicId
+          && request.resource.data.keys().hasOnly(['topicId', 'ownerUid', 'active', 'audience', 'createdAt', 'revokedAt'])
+          && ((resource.data.active == true
+              && request.resource.data.active == true
+              && request.resource.data.audience in ['anyone', 'approvedUsers'])
+            || (resource.data.active == true && request.resource.data.active == false));
 
-      allow delete: if false;
+      allow delete: if isAdmin();
     }
   }
 }

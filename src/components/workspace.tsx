@@ -18,14 +18,15 @@ import {
   setDoc,
   updateDoc,
   where,
+  writeBatch,
 } from "firebase/firestore";
-import { ref, uploadBytes } from "firebase/storage";
+import { deleteObject, listAll, ref, uploadBytes, type StorageReference } from "firebase/storage";
 import { AssetPreview } from "@/components/asset-preview";
 import { Icon } from "@/components/icons";
 import { auth, db, firebaseConfigured, storage } from "@/lib/firebase/client";
 import { messages } from "@/lib/i18n";
 import { validateUpload } from "@/lib/file-policy";
-import type { LabelTone, Locale, PublicUser, Tip, TipBlock, Topic, TopicInvitation, TopicRole, UserProfile } from "@/lib/types";
+import type { AccessRequest, LabelTone, Locale, PublicUser, ShareAudience, Tip, TipBlock, Topic, TopicInvitation, TopicRole, UserProfile } from "@/lib/types";
 
 const tones: LabelTone[] = ["line-red", "line-blue", "line-amber", "line-green", "ink"];
 const routeNames: Record<LabelTone, string> = {
@@ -47,30 +48,34 @@ async function hashEmail(email: string): Promise<string> {
   return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
-async function loadLibrary(user: User, username?: string) {
-  const ownSnapshot = await getDocs(query(collection(db, "topics"), where("ownerId", "==", user.uid)));
+async function loadLibrary(user: User, username?: string, isAdmin = false) {
+  const ownSnapshot = isAdmin
+    ? await getDocs(collection(db, "topics"))
+    : await getDocs(query(collection(db, "topics"), where("ownerId", "==", user.uid)));
   const topics = new Map<string, Topic>();
   ownSnapshot.docs.forEach((snapshot) => {
     const value = snapshot.data();
-    topics.set(snapshot.id, { id: snapshot.id, ...value, role: "owner" } as Topic);
+    topics.set(snapshot.id, { id: snapshot.id, ...value, role: isAdmin && value.ownerId !== user.uid ? "admin" : "owner" } as Topic);
   });
 
-  const memberSnapshot = await getDocs(query(collectionGroup(db, "members"), where("uid", "==", user.uid)));
-  await Promise.all(memberSnapshot.docs.map(async (member) => {
-    const topicRef = member.ref.parent.parent;
-    if (!topicRef || topics.has(topicRef.id)) return;
-    const topicSnapshot = await getDoc(topicRef);
-    if (!topicSnapshot.exists()) return;
-    topics.set(topicRef.id, {
-      id: topicRef.id,
-      ...topicSnapshot.data(),
-      role: member.data().role as TopicRole,
-    } as Topic);
-  }));
+  if (!isAdmin) {
+    const memberSnapshot = await getDocs(query(collectionGroup(db, "members"), where("uid", "==", user.uid)));
+    await Promise.all(memberSnapshot.docs.map(async (member) => {
+      const topicRef = member.ref.parent.parent;
+      if (!topicRef || topics.has(topicRef.id)) return;
+      const topicSnapshot = await getDoc(topicRef);
+      if (!topicSnapshot.exists()) return;
+      topics.set(topicRef.id, {
+        id: topicRef.id,
+        ...topicSnapshot.data(),
+        role: member.data().role as TopicRole,
+      } as Topic);
+    }));
+  }
 
   const result = [...topics.values()].sort((a, b) => timeValue(b.updatedAt) - timeValue(a.updatedAt));
   const pendingInvitations = new Map<string, TopicInvitation>();
-  if (user.email && user.emailVerified) {
+  if (!isAdmin && user.email && user.emailVerified) {
     const digest = await hashEmail(user.email);
     const received = await getDocs(query(
       collection(db, "invitations"),
@@ -79,7 +84,7 @@ async function loadLibrary(user: User, username?: string) {
     ));
     received.docs.forEach((snapshot) => pendingInvitations.set(snapshot.id, { id: snapshot.id, ...snapshot.data() } as TopicInvitation));
   }
-  if (username) {
+  if (!isAdmin && username) {
     const received = await getDocs(query(
       collection(db, "invitations"),
       where("inviteeUsername", "==", username),
@@ -88,6 +93,12 @@ async function loadLibrary(user: User, username?: string) {
     received.docs.forEach((snapshot) => pendingInvitations.set(snapshot.id, { id: snapshot.id, ...snapshot.data() } as TopicInvitation));
   }
   return { topics: result, invitations: [...pendingInvitations.values()] };
+}
+
+async function deleteStorageTree(folder: StorageReference) {
+  const listing = await listAll(folder);
+  await Promise.all(listing.items.map((item) => deleteObject(item)));
+  await Promise.all(listing.prefixes.map((prefix) => deleteStorageTree(prefix)));
 }
 
 function Modal({ title, onClose, children, wide = false }: { title: string; onClose: () => void; children: React.ReactNode; wide?: boolean }) {
@@ -153,25 +164,33 @@ export function Workspace() {
   const t = messages(locale);
   const [user, setUser] = useState<User | null>(null);
   const [profile, setProfile] = useState<UserProfile | null>(null);
+  const [isAdmin, setIsAdmin] = useState(false);
+  const [approvalState, setApprovalState] = useState<"pending" | "approved" | "unverified" | null>(null);
+  const [pendingAccessRequests, setPendingAccessRequests] = useState<AccessRequest[]>([]);
   const [topics, setTopics] = useState<Topic[]>([]);
   const [invitations, setInvitations] = useState<TopicInvitation[]>([]);
   const [busy, setBusy] = useState(true);
   const [working, setWorking] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
-  const [activeView, setActiveView] = useState<"all" | "shared">("all");
+  const [activeView, setActiveView] = useState<"all" | "shared" | "admin">("all");
   const [search, setSearch] = useState("");
   const [selectedTopicId, setSelectedTopicId] = useState<string | null>(null);
   const [tips, setTips] = useState<Tip[]>([]);
   const [selectedTipId, setSelectedTipId] = useState<string | null>(null);
   const [draft, setDraft] = useState<{ id: string | null; title: string; summary: string; blocks: TipBlock[] } | null>(null);
   const [topicModal, setTopicModal] = useState(false);
+  const [topicEditModal, setTopicEditModal] = useState(false);
   const [shareModal, setShareModal] = useState(false);
   const [mobileNav, setMobileNav] = useState(false);
   const [accountMenu, setAccountMenu] = useState(false);
   const [topicTitle, setTopicTitle] = useState("");
   const [topicDescription, setTopicDescription] = useState("");
   const [coverFile, setCoverFile] = useState<File | null>(null);
+  const [editTopicTitle, setEditTopicTitle] = useState("");
+  const [editTopicDescription, setEditTopicDescription] = useState("");
+  const [editCoverFile, setEditCoverFile] = useState<File | null>(null);
+  const [removeCover, setRemoveCover] = useState(false);
   const [username, setUsername] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [lookupUsername, setLookupUsername] = useState("");
@@ -179,6 +198,7 @@ export function Workspace() {
   const [lookupError, setLookupError] = useState("");
   const [inviteEmail, setInviteEmail] = useState("");
   const [shareRole, setShareRole] = useState<TopicRole>("viewer");
+  const [shareAudience, setShareAudience] = useState<ShareAudience>("anyone");
   const [shareBusy, setShareBusy] = useState(false);
   const [copied, setCopied] = useState(false);
 
@@ -187,14 +207,52 @@ export function Workspace() {
       setUser(nextUser);
       setError("");
       if (!nextUser) {
+        setIsAdmin(false);
+        setApprovalState(null);
         setProfile(null);
         setTopics([]);
         setInvitations([]);
+        setPendingAccessRequests([]);
         setBusy(false);
         return;
       }
       setBusy(true);
       try {
+        const admin = nextUser.emailVerified
+          && nextUser.email?.trim().toLowerCase() === "tuananhdao.dev.js@gmail.com";
+        setIsAdmin(admin);
+        if (!admin) {
+          if (!nextUser.email || !nextUser.emailVerified) {
+            setApprovalState("unverified");
+            setProfile(null);
+            setTopics([]);
+            setInvitations([]);
+            return;
+          }
+          const requestRef = doc(db, "accessRequests", nextUser.uid);
+          await runTransaction(db, async (transaction) => {
+            const requestSnapshot = await transaction.get(requestRef);
+            if (!requestSnapshot.exists()) {
+              transaction.set(requestRef, {
+                uid: nextUser.uid,
+                email: nextUser.email,
+                displayName: nextUser.displayName ?? "",
+                avatarUrl: nextUser.photoURL,
+                status: "pending",
+                createdAt: serverTimestamp(),
+              });
+            }
+          });
+          const requestSnapshot = await getDoc(requestRef);
+          if (!requestSnapshot.exists() || requestSnapshot.data().status !== "approved") {
+            setApprovalState("pending");
+            setProfile(null);
+            setTopics([]);
+            setInvitations([]);
+            return;
+          }
+        }
+        setApprovalState("approved");
         const profileSnapshot = await getDoc(doc(db, "users", nextUser.uid));
         let nextUsername: string | undefined;
         if (profileSnapshot.exists()) {
@@ -206,7 +264,7 @@ export function Workspace() {
           setUsername("");
           setDisplayName(nextUser.displayName ?? "");
         }
-        const library = await loadLibrary(nextUser, nextUsername);
+        const library = await loadLibrary(nextUser, nextUsername, admin);
         setTopics(library.topics);
         setInvitations(library.invitations);
       } catch (cause) {
@@ -219,12 +277,21 @@ export function Workspace() {
 
   const selectedTopic = topics.find((topic) => topic.id === selectedTopicId) ?? null;
   const selectedTip = tips.find((tip) => tip.id === selectedTipId) ?? null;
-  const canEdit = selectedTopic?.role === "owner" || selectedTopic?.role === "editor";
+  const canEdit = isAdmin || selectedTopic?.role === "owner" || selectedTopic?.role === "editor";
   const visibleTopics = useMemo(() => topics.filter((topic) => {
-    const isShared = topic.role !== "owner";
-    const modeMatches = activeView === "all" ? !isShared : isShared;
+    const isShared = topic.role === "viewer" || topic.role === "editor";
+    const modeMatches = activeView === "all" ? topic.role === "owner" : activeView === "shared" ? isShared : true;
     return modeMatches && `${topic.title} ${topic.description}`.toLowerCase().includes(search.trim().toLowerCase());
   }), [topics, activeView, search]);
+
+  useEffect(() => {
+    if (!isAdmin || activeView !== "admin") return;
+    let current = true;
+    getDocs(query(collection(db, "accessRequests"), where("status", "==", "pending")))
+      .then((snapshot) => current && setPendingAccessRequests(snapshot.docs.map((item) => item.data() as AccessRequest)))
+      .catch((cause) => current && setError(cause instanceof Error ? cause.message : t.error));
+    return () => { current = false; };
+  }, [isAdmin, activeView, t.error]);
 
   useEffect(() => {
     const topicId = selectedTopicId;
@@ -242,7 +309,7 @@ export function Workspace() {
     setLocale(next);
   }
 
-  function clearTopicSelection(view: "all" | "shared" = activeView) {
+  function clearTopicSelection(view: "all" | "shared" | "admin" = activeView) {
     setActiveView(view);
     setSelectedTopicId(null);
     setSelectedTipId(null);
@@ -252,9 +319,145 @@ export function Workspace() {
 
   async function refreshLibrary(nextUser = user, nextUsername = profile?.username) {
     if (!nextUser) return;
-    const library = await loadLibrary(nextUser, nextUsername);
+    const library = await loadLibrary(nextUser, nextUsername, isAdmin);
     setTopics(library.topics);
     setInvitations(library.invitations);
+  }
+
+  async function checkApproval() {
+    if (!user || isAdmin) return;
+    setWorking(true);
+    setError("");
+    try {
+      const access = await getDoc(doc(db, "accessRequests", user.uid));
+      if (!access.exists() || access.data().status !== "approved") {
+        setApprovalState("pending");
+        return;
+      }
+      setBusy(true);
+      setApprovalState("approved");
+      const profileSnapshot = await getDoc(doc(db, "users", user.uid));
+      const nextUsername = profileSnapshot.exists() && typeof profileSnapshot.data().username === "string"
+        ? profileSnapshot.data().username as string
+        : undefined;
+      setProfile(profileSnapshot.exists()
+        ? { uid: user.uid, email: user.email ?? "", ...profileSnapshot.data() } as UserProfile
+        : null);
+      const library = await loadLibrary(user, nextUsername, isAdmin);
+      setTopics(library.topics);
+      setInvitations(library.invitations);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : t.error);
+    } finally {
+      setWorking(false);
+      setBusy(false);
+    }
+  }
+
+  async function approveAccount(request: AccessRequest) {
+    if (!user || !isAdmin) return;
+    setWorking(true);
+    setError("");
+    try {
+      await updateDoc(doc(db, "accessRequests", request.uid), {
+        status: "approved",
+        approvedBy: user.uid,
+        approvedAt: serverTimestamp(),
+      });
+      setPendingAccessRequests((items) => items.filter((item) => item.uid !== request.uid));
+      setNotice(t.approve);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : t.error);
+    } finally {
+      setWorking(false);
+    }
+  }
+
+  function openTopicEditor(topic: Topic) {
+    setEditTopicTitle(topic.title);
+    setEditTopicDescription(topic.description);
+    setEditCoverFile(null);
+    setRemoveCover(false);
+    setTopicEditModal(true);
+  }
+
+  async function saveTopic(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!selectedTopic || !canEdit || !editTopicTitle.trim()) return;
+    setWorking(true);
+    setError("");
+    try {
+      let coverImagePath = removeCover ? null : selectedTopic.coverImagePath;
+      if (editCoverFile) {
+        const validation = validateUpload(editCoverFile);
+        if (!validation.ok) throw new Error(validation.reason === "size" ? t.sizeError : t.typeError);
+        if (!validation.isImage) throw new Error(t.typeError);
+        coverImagePath = `topics/${selectedTopic.id}/cover/${crypto.randomUUID()}.${editCoverFile.name.split(".").pop()?.toLowerCase()}`;
+        await uploadBytes(ref(storage, coverImagePath), editCoverFile, { contentType: validation.contentType });
+      }
+      await updateDoc(doc(db, "topics", selectedTopic.id), {
+        title: editTopicTitle.trim(),
+        description: editTopicDescription.trim(),
+        coverImagePath,
+        updatedAt: serverTimestamp(),
+      });
+      if (selectedTopic.coverImagePath && selectedTopic.coverImagePath !== coverImagePath) {
+        await deleteObject(ref(storage, selectedTopic.coverImagePath)).catch((cause: unknown) => {
+          if (!(cause && typeof cause === "object" && "code" in cause && cause.code === "storage/object-not-found")) throw cause;
+        });
+      }
+      setTopics((items) => items.map((item) => item.id === selectedTopic.id
+        ? { ...item, title: editTopicTitle.trim(), description: editTopicDescription.trim(), coverImagePath } : item));
+      setTopicEditModal(false);
+      setNotice(t.save);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : t.error);
+    } finally {
+      setWorking(false);
+    }
+  }
+
+  async function deleteTopic(topic: Topic) {
+    if (!isAdmin || !window.confirm(`${t.deleteTopic}: “${topic.title}”?\n\n${t.confirmDeleteTopic}`)) return;
+    setWorking(true);
+    setError("");
+    try {
+      try {
+        await deleteStorageTree(ref(storage, `topics/${topic.id}`));
+      } catch (cause) {
+        if (!(cause && typeof cause === "object" && "code" in cause && cause.code === "storage/bucket-not-found")) throw cause;
+      }
+
+      const [tipSnapshot, memberSnapshot, invitationSnapshot] = await Promise.all([
+        getDocs(collection(db, "topics", topic.id, "tips")),
+        getDocs(collection(db, "topics", topic.id, "members")),
+        getDocs(query(collection(db, "invitations"), where("topicId", "==", topic.id))),
+      ]);
+      const references = [
+        ...tipSnapshot.docs.map((item) => item.ref),
+        ...memberSnapshot.docs.map((item) => item.ref),
+        ...invitationSnapshot.docs.map((item) => item.ref),
+      ];
+      if (topic.publicShareId) references.push(doc(db, "publicShares", topic.publicShareId));
+      references.push(doc(db, "topics", topic.id));
+      for (let offset = 0; offset < references.length; offset += 450) {
+        const batch = writeBatch(db);
+        references.slice(offset, offset + 450).forEach((reference) => batch.delete(reference));
+        await batch.commit();
+      }
+      setTopics((items) => items.filter((item) => item.id !== topic.id));
+      if (selectedTopicId === topic.id) {
+        setSelectedTopicId(null);
+        setSelectedTipId(null);
+        setDraft(null);
+        setTips([]);
+      }
+      setNotice(t.topicDeleted);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : t.error);
+    } finally {
+      setWorking(false);
+    }
   }
 
   async function handleGoogleSignIn() {
@@ -315,7 +518,7 @@ export function Workspace() {
       });
       const snapshot = await getDoc(userRef);
       setProfile({ uid: user.uid, email: user.email, ...snapshot.data() } as UserProfile);
-      const library = await loadLibrary(user, cleanUsername);
+      const library = await loadLibrary(user, cleanUsername, isAdmin);
       setTopics(library.topics);
       setInvitations(library.invitations);
       setNotice(t.continue);
@@ -402,6 +605,12 @@ export function Workspace() {
         createdAt: previous?.createdAt ?? serverTimestamp(),
         updatedAt: serverTimestamp(),
       });
+      const keptPaths = new Set(draft.blocks.flatMap((block) => block.type === "image" || block.type === "file" ? [block.path] : []));
+      const removedPaths = (previous?.blocks ?? []).flatMap((block) =>
+        (block.type === "image" || block.type === "file") && !keptPaths.has(block.path) ? [block.path] : []);
+      await Promise.all(removedPaths.map((path) => deleteObject(ref(storage, path)).catch((cause: unknown) => {
+        if (!(cause && typeof cause === "object" && "code" in cause && cause.code === "storage/object-not-found")) throw cause;
+      })));
       await updateDoc(doc(db, "topics", selectedTopic.id), { updatedAt: serverTimestamp() });
       const updatedTips = await getDocs(query(collection(db, "topics", selectedTopic.id, "tips"), orderBy("position")));
       const loaded = updatedTips.docs.map((item) => ({ id: item.id, ...item.data() } as Tip));
@@ -550,7 +759,7 @@ export function Workspace() {
   }
 
   async function setPublicLink(active: boolean) {
-    if (!user || !selectedTopic || selectedTopic.role !== "owner") return;
+    if (!user || !selectedTopic || !(isAdmin || selectedTopic.role === "owner")) return;
     setWorking(true);
     setError("");
     try {
@@ -563,8 +772,9 @@ export function Workspace() {
         if (active) {
           transaction.set(shareRef, {
             topicId: selectedTopic.id,
-            ownerUid: user.uid,
+            ownerUid: selectedTopic.ownerId,
             active: true,
+            audience: shareAudience,
             createdAt: serverTimestamp(),
           });
           transaction.update(topicRef, { visibility: "unlisted", publicShareId: shareId, updatedAt: serverTimestamp() });
@@ -576,6 +786,36 @@ export function Workspace() {
       const current = await getDoc(topicRef);
       if (current.exists()) setTopics((items) => items.map((item) => item.id === selectedTopic.id ? { ...item, ...current.data() } as Topic : item));
       setNotice(active ? t.createLink : t.revokeLink);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : t.error);
+    } finally {
+      setWorking(false);
+    }
+  }
+
+  async function openShareModal() {
+    if (!selectedTopic) return;
+    setLookupError("");
+    setShareAudience("anyone");
+    if (selectedTopic.publicShareId) {
+      try {
+        const current = await getDoc(doc(db, "publicShares", selectedTopic.publicShareId));
+        setShareAudience(current.data()?.audience === "approvedUsers" ? "approvedUsers" : "anyone");
+      } catch (cause) {
+        setError(cause instanceof Error ? cause.message : t.error);
+      }
+    }
+    setShareModal(true);
+  }
+
+  async function changeShareAudience(audience: ShareAudience) {
+    if (!selectedTopic?.publicShareId || !(isAdmin || selectedTopic.role === "owner")) return;
+    setWorking(true);
+    setError("");
+    try {
+      await updateDoc(doc(db, "publicShares", selectedTopic.publicShareId), { audience });
+      setShareAudience(audience);
+      setNotice(t.save);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : t.error);
     } finally {
@@ -596,6 +836,10 @@ export function Workspace() {
     if (!selectedTopic || !canEdit || !window.confirm(`${t.confirmDelete} “${tip.title || t.untitled}”?`)) return;
     try {
       await deleteDoc(doc(db, "topics", selectedTopic.id, "tips", tip.id));
+      const paths = (tip.blocks ?? []).flatMap((block) => block.type === "image" || block.type === "file" ? [block.path] : []);
+      await Promise.all(paths.map((path) => deleteObject(ref(storage, path)).catch((cause: unknown) => {
+        if (!(cause && typeof cause === "object" && "code" in cause && cause.code === "storage/object-not-found")) throw cause;
+      })));
       setTips((items) => items.filter((item) => item.id !== tip.id));
       setSelectedTipId(null);
       setNotice(t.remove);
@@ -603,6 +847,18 @@ export function Workspace() {
   }
 
   if (busy) return <div className="app-loading"><span className="loading-mark"/><p>{t.loading}</p></div>;
+
+  if (user && approvalState !== "approved") return <main className="approval-screen">
+    <div className="approval-card">
+      <span className="approval-mark"><Icon name="lock" size={22}/></span>
+      <span className="section-kicker">Tipstash</span>
+      <h1>{approvalState === "unverified" ? t.approvalUnverified : t.approvalTitle}</h1>
+      <p>{approvalState === "unverified" ? t.approvalUnverified : t.approvalBody}</p>
+      <div className="approval-account"><AccountAvatar profile={null} user={user}/><span>{user.email}</span></div>
+      {approvalState === "pending" && <><div className="approval-status"><i/>{t.pending}</div><button className="primary-button" onClick={() => void checkApproval()} disabled={working}>{working ? "…" : t.approvalCheck}<Icon name="arrow" size={16}/></button></>}
+      <div className="approval-actions"><button className="text-button" onClick={() => changeLocale(locale === "vi" ? "en" : "vi")}>{locale === "vi" ? "English" : "Tiếng Việt"}</button><button className="text-button" onClick={() => signOut(auth)}>{t.signOut}</button></div>
+    </div>
+  </main>;
 
   const sidebar = <>
     <button type="button" className="brand" onClick={() => { clearTopicSelection("all"); setMobileNav(false); }}>
@@ -614,13 +870,16 @@ export function Workspace() {
         <Icon name="library"/><span>{t.allTopics}</span><b>{topics.filter((topic) => topic.role === "owner").length}</b>
       </button>
       <button className={`nav-item ${activeView === "shared" && !selectedTopic ? "selected" : ""}`} onClick={() => { clearTopicSelection("shared"); setMobileNav(false); }}>
-        <Icon name="share"/><span>{t.shared}</span><b>{topics.filter((topic) => topic.role !== "owner").length}</b>
+        <Icon name="share"/><span>{t.shared}</span><b>{topics.filter((topic) => topic.role === "viewer" || topic.role === "editor").length}</b>
       </button>
+      {isAdmin && <button className={`nav-item ${activeView === "admin" && !selectedTopic ? "selected" : ""}`} onClick={() => { clearTopicSelection("admin"); setMobileNav(false); }}>
+        <Icon name="settings"/><span>{t.admin}</span><b>{pendingAccessRequests.length}</b>
+      </button>}
     </nav>
     <div className="sidebar-divider"/>
-    <div className="topic-nav-title"><span>{activeView === "shared" ? t.shared : t.library}</span><button aria-label={t.newTopic} onClick={() => setTopicModal(true)} disabled={!user || !profile}><Icon name="plus" size={16}/></button></div>
+    <div className="topic-nav-title"><span>{activeView === "shared" ? t.shared : activeView === "admin" ? t.adminTopics : t.library}</span><button aria-label={t.newTopic} onClick={() => setTopicModal(true)} disabled={!user || (!profile && !isAdmin)}><Icon name="plus" size={16}/></button></div>
     <nav className="topic-nav" aria-label="Topics">
-      {(activeView === "shared" ? topics.filter((topic) => topic.role !== "owner") : topics.filter((topic) => topic.role === "owner")).slice(0, 8).map((topic, index) => <button key={topic.id} className={`topic-nav-item ${selectedTopicId === topic.id ? "selected" : ""}`} onClick={() => openTopic(topic)}>
+      {(activeView === "admin" ? topics : activeView === "shared" ? topics.filter((topic) => topic.role === "viewer" || topic.role === "editor") : topics.filter((topic) => topic.role === "owner")).slice(0, 8).map((topic, index) => <button key={topic.id} className={`topic-nav-item ${selectedTopicId === topic.id ? "selected" : ""}`} onClick={() => openTopic(topic)}>
         <span className={`station-dot tone-dot-${tones[index % tones.length]}`}/><span>{topic.title}</span>
       </button>)}
       {topics.length === 0 && <p className="sidebar-empty">{t.emptyTitle}</p>}
@@ -659,15 +918,15 @@ export function Workspace() {
             <div className="welcome-trust"><Icon name="lock" size={15}/><span>{t.private} · {t.uploadLimit}</span></div>
           </div>
           <div className="welcome-map" aria-hidden="true"><div className="map-lines"><i className="map-line red"/><i className="map-line blue"/><i className="map-line amber"/><i className="map-line green"/>{[0,1,2,3,4,5,6,7].map((x) => <b key={x} className={`station station-${x}`}/>)}</div><div className="map-caption"><span>{t.mapSubtitle}</span><strong>{t.mapTitle}</strong><i>TIPSTASH / INDEX</i></div></div>
-        </section> : !profile ? <Modal title={t.usernameSetup} onClose={() => {}}>
+        </section> : !profile && !isAdmin ? <Modal title={t.usernameSetup} onClose={() => {}}>
           <form className="form-stack" onSubmit={saveProfile}><p className="form-explainer">{t.usernameSetupNote}</p><label>{t.username}<div className="username-field"><span>@</span><input autoComplete="username" required value={username} onChange={(event) => setUsername(event.target.value)} minLength={3} maxLength={24} pattern="[a-zA-Z0-9][a-zA-Z0-9._-]{2,23}"/></div></label><label>{t.displayName}<input value={displayName} onChange={(event) => setDisplayName(event.target.value)} maxLength={60}/></label><p className="field-note">{t.usernameRule}</p><button className="primary-button" disabled={working}>{working ? "…" : t.continue}<Icon name="arrow" size={16}/></button></form>
         </Modal> : selectedTopic ? <section className="topic-screen">
           <div className="topic-heading">
-            <div className="topic-heading-main"><div className="topic-route-mark"><RouteMarks tone="line-blue"/><span>{selectedTopic.role === "owner" ? t.owner : selectedTopic.role === "editor" ? t.editor : t.viewer}</span></div><h1>{selectedTopic.title}</h1><p>{selectedTopic.description || t.noDescription}</p>
+            <div className="topic-heading-main"><div className="topic-route-mark"><RouteMarks tone="line-blue"/><span>{selectedTopic.role === "owner" ? t.owner : selectedTopic.role === "admin" ? t.admin : selectedTopic.role === "editor" ? t.editor : t.viewer}</span></div><h1>{selectedTopic.title}</h1><p>{selectedTopic.description || t.noDescription}</p>
               <div className="topic-meta"><span className="access-pill"><Icon name={selectedTopic.publicShareId ? "globe" : "lock"} size={13}/>{selectedTopic.publicShareId ? t.publicLink : selectedTopic.role === "owner" ? t.privateBadge : t.sharedBadge}</span><span className="dot-separator"/>{tips.length} {t.tips}</div>
             </div>
             {selectedTopic.coverImagePath && <AssetPreview path={selectedTopic.coverImagePath} alt="" className="topic-cover"/>}
-            <div className="topic-heading-actions">{canEdit && <button className="secondary-button" onClick={() => setShareModal(true)}><Icon name="share" size={16}/>{t.share}</button>}</div>
+            <div className="topic-heading-actions">{canEdit && <><button className="secondary-button" onClick={() => openTopicEditor(selectedTopic)}><Icon name="settings" size={16}/>{t.editTopic}</button><button className="secondary-button" onClick={() => void openShareModal()}><Icon name="share" size={16}/>{t.share}</button>{isAdmin && <button className="revoke-button" onClick={() => void deleteTopic(selectedTopic)} disabled={working}><Icon name="trash" size={15}/>{t.deleteTopic}</button>}</>}</div>
           </div>
           <div className="topic-workspace">
             <section className="tip-index-panel">
@@ -702,6 +961,22 @@ export function Workspace() {
               </article> : <div className="tip-placeholder"><div className="placeholder-route"><span/><i/><span/></div><h2>{tips.length ? t.emptyTitle : t.noTips}</h2><p>{tips.length ? t.libraryIntro : t.emptyBody}</p>{canEdit && <button className="text-button" onClick={startNewTip}>{t.newTip}<Icon name="arrow" size={15}/></button>}</div>}
             </section>
           </div>
+        </section> : activeView === "admin" && isAdmin ? <section className="admin-screen">
+          <div className="library-intro"><div><span className="section-kicker">Tipstash</span><h1>{t.admin}</h1><p>{t.approvalBody}</p></div><span className="admin-count">{pendingAccessRequests.length} {t.pending}</span></div>
+          <div className="admin-grid">
+            <section className="admin-panel"><div className="admin-panel-heading"><div><span className="section-kicker">Tipstash</span><h2>{t.approvalQueue}</h2></div><span>{pendingAccessRequests.length}</span></div>
+              {pendingAccessRequests.length === 0 ? <p className="admin-empty">{t.approvalQueueEmpty}</p> : <div className="admin-request-list">{pendingAccessRequests.map((request) => <article className="admin-request" key={request.uid}>
+                <div className="admin-person"><span className="avatar avatar-fallback">{request.displayName.slice(0, 1).toUpperCase() || "T"}</span><span><strong>{request.displayName || request.email}</strong><small>{request.email}</small></span></div>
+                <button className="small-primary" disabled={working} onClick={() => void approveAccount(request)}><Icon name="check" size={14}/>{t.approve}</button>
+              </article>)}</div>}
+            </section>
+            <section className="admin-panel"><div className="admin-panel-heading"><div><span className="section-kicker">Tipstash</span><h2>{t.adminTopics}</h2></div><span>{topics.length}</span></div>
+              {topics.filter((topic) => `${topic.title} ${topic.description}`.toLowerCase().includes(search.trim().toLowerCase())).length === 0 ? <p className="admin-empty">{t.noResults}</p> : <div className="admin-topic-list">{topics.filter((topic) => `${topic.title} ${topic.description}`.toLowerCase().includes(search.trim().toLowerCase())).map((topic) => <article className="admin-topic" key={topic.id}>
+                <button className="admin-topic-open" onClick={() => void openTopic(topic)}><span><strong>{topic.title}</strong><small>{topic.description || t.noDescription}</small></span><small>{topic.ownerId === user.uid ? t.owner : topic.ownerId}</small></button>
+                <button className="tiny-icon danger" aria-label={`${t.deleteTopic}: ${topic.title}`} title={t.deleteTopic} disabled={working} onClick={() => void deleteTopic(topic)}><Icon name="trash" size={15}/></button>
+              </article>)}</div>}
+            </section>
+          </div>
         </section> : <section className="library-screen">
           <div className="library-intro"><div><span className="section-kicker">{activeView === "shared" ? t.shared : t.private}</span><h1>{activeView === "shared" ? t.shared : t.libraryTitle}</h1><p>{t.libraryIntro}</p></div><button className="primary-button" onClick={() => setTopicModal(true)}><Icon name="plus" size={17}/>{t.newTopic}</button></div>
           {invitations.length > 0 && <div className="invitation-strip"><div><span className="invitation-mark"><Icon name="share" size={17}/></span><span><strong>{invitations.length} {t.invitation}{invitations.length > 1 ? "s" : ""}</strong><small>{t.inviteNote}</small></span></div><div className="invitation-list">{invitations.map((invitation) => <button key={invitation.id} className="accept-button" disabled={working} onClick={() => acceptInvitation(invitation)}>{t.accept} · {invitation.role === "editor" ? t.editor : t.viewer}</button>)}</div></div>}
@@ -718,13 +993,28 @@ export function Workspace() {
 
     {topicModal && <Modal title={t.newTopic} onClose={() => setTopicModal(false)}><form className="form-stack" onSubmit={createTopic}><label>{t.topicName}<input autoFocus value={topicTitle} onChange={(event) => setTopicTitle(event.target.value)} required maxLength={90}/></label><label>{t.topicDescription}<textarea rows={3} value={topicDescription} onChange={(event) => setTopicDescription(event.target.value)} maxLength={300}/></label><label>{t.cover}<span className="field-note">{t.uploadLimit}</span><input type="file" accept="image/jpeg,image/png,image/webp,image/gif,image/avif" onChange={(event) => setCoverFile(event.target.files?.[0] ?? null)}/></label><div className="private-default"><Icon name="lock" size={15}/><span>{t.privateBadge}</span><small>{t.private}</small></div><div className="modal-actions"><button type="button" className="text-button" onClick={() => setTopicModal(false)}>{t.cancel}</button><button className="primary-button" disabled={working || !topicTitle.trim()}>{working ? "…" : t.create}<Icon name="arrow" size={16}/></button></div></form></Modal>}
 
+    {topicEditModal && selectedTopic && <Modal title={t.editTopic} onClose={() => setTopicEditModal(false)}><form className="form-stack" onSubmit={saveTopic}>
+      <label>{t.topicName}<input autoFocus value={editTopicTitle} onChange={(event) => setEditTopicTitle(event.target.value)} required maxLength={90}/></label>
+      <label>{t.topicDescription}<textarea rows={3} value={editTopicDescription} onChange={(event) => setEditTopicDescription(event.target.value)} maxLength={300}/></label>
+      <label>{t.cover}<span className="field-note">{t.uploadLimit}</span><input type="file" accept="image/jpeg,image/png,image/webp,image/gif,image/avif" onChange={(event) => { setEditCoverFile(event.target.files?.[0] ?? null); setRemoveCover(false); }}/></label>
+      {selectedTopic.coverImagePath && <label className="cover-remove-option"><input type="checkbox" checked={removeCover} onChange={(event) => setRemoveCover(event.target.checked)}/>{t.removeCover}</label>}
+      <div className="modal-actions"><button type="button" className="text-button" onClick={() => setTopicEditModal(false)}>{t.cancel}</button><button className="primary-button" disabled={working || !editTopicTitle.trim()}>{working ? "…" : t.save}<Icon name="check" size={16}/></button></div>
+    </form></Modal>}
+
     {shareModal && selectedTopic && <Modal title={t.shareWith} onClose={() => setShareModal(false)} wide><div className="share-content">
       <p className="form-explainer">{t.allAccess}: <strong>{selectedTopic.title}</strong></p>
       <label className="role-select-label">{t.access}<select value={shareRole} onChange={(event) => setShareRole(event.target.value as TopicRole)}><option value="viewer">{t.viewer}</option><option value="editor">{t.editor}</option></select></label>
       <div className="share-columns"><form className="share-method" onSubmit={lookupAccount}><div className="share-method-title"><span className="share-icon"><Icon name="user" size={17}/></span><div><strong>{t.username}</strong><small>{t.exactMatch}</small></div></div><div className="share-input-row"><span>@</span><input value={lookupUsername} onChange={(event) => { setLookupUsername(event.target.value); setLookupResult(null); }} placeholder="username" required minLength={3} maxLength={24}/><button className="secondary-button" disabled={shareBusy}>{t.lookup}</button></div>{lookupResult && <div className="lookup-result">{lookupResult.avatarUrl ? <Image width={26} height={26} unoptimized src={lookupResult.avatarUrl} alt="" referrerPolicy="no-referrer"/> : <span className="avatar avatar-fallback">{lookupResult.displayName.slice(0, 1).toUpperCase()}</span>}<span><strong>{lookupResult.displayName}</strong><small>@{lookupResult.username}</small></span><button type="button" className="small-primary" onClick={() => sendShare({ username: lookupResult.username })} disabled={shareBusy}>{t.share}</button></div>}</form>
         <form className="share-method" onSubmit={(event) => { event.preventDefault(); void sendShare({ email: inviteEmail }); }}><div className="share-method-title"><span className="share-icon"><Icon name="file" size={17}/></span><div><strong>{t.email}</strong><small>{t.pending}</small></div></div><div className="share-input-row"><input type="email" value={inviteEmail} onChange={(event) => setInviteEmail(event.target.value)} placeholder="name@example.com" required/><button className="secondary-button" disabled={shareBusy}>{t.invite}</button></div><p className="field-note">{t.inviteNote}</p></form></div>
       {lookupError && <p className="inline-error" role="alert">{lookupError}</p>}
-      <div className="public-link-panel"><div className="public-link-copy"><span className="share-icon"><Icon name="globe" size={17}/></span><div><strong>{t.publicLink}</strong><small>{t.linkWarning}</small></div></div>{selectedTopic.publicShareId ? <div className="public-link-controls"><code>{typeof window === "undefined" ? "" : window.location.origin}/s/{selectedTopic.publicShareId}</code><button className="secondary-button" onClick={copyPublicLink}><Icon name={copied ? "check" : "copy"} size={15}/>{copied ? t.copied : t.copyLink}</button><button className="revoke-button" onClick={() => setPublicLink(false)} disabled={working}>{t.revokeLink}</button></div> : <button className="secondary-button" onClick={() => setPublicLink(true)} disabled={working}><Icon name="plus" size={15}/>{t.createLink}</button>}</div>
+      {(isAdmin || selectedTopic.role === "owner") && <div className="public-link-panel">
+        <div className="public-link-copy"><span className="share-icon"><Icon name="globe" size={17}/></span><div><strong>{t.publicLink}</strong><small>{shareAudience === "anyone" ? t.linkWarning : t.approvedUsersNote}</small></div></div>
+        <fieldset className="audience-picker"><legend>{t.access}</legend>
+          <label><input type="radio" name="share-audience" value="anyone" checked={shareAudience === "anyone"} disabled={working} onChange={() => selectedTopic.publicShareId ? void changeShareAudience("anyone") : setShareAudience("anyone")}/><span>{t.anyoneWithLink}</span></label>
+          <label><input type="radio" name="share-audience" value="approvedUsers" checked={shareAudience === "approvedUsers"} disabled={working} onChange={() => selectedTopic.publicShareId ? void changeShareAudience("approvedUsers") : setShareAudience("approvedUsers")}/><span>{t.approvedUsersOnly}</span></label>
+        </fieldset>
+        {selectedTopic.publicShareId ? <div className="public-link-controls"><code>{typeof window === "undefined" ? "" : window.location.origin}/s/{selectedTopic.publicShareId}</code><button className="secondary-button" onClick={copyPublicLink}><Icon name={copied ? "check" : "copy"} size={15}/>{copied ? t.copied : t.copyLink}</button><button className="revoke-button" onClick={() => setPublicLink(false)} disabled={working}>{t.revokeLink}</button></div> : <button className="secondary-button" onClick={() => setPublicLink(true)} disabled={working}><Icon name="plus" size={15}/>{t.createLink}</button>}
+      </div>}
     </div></Modal>}
   </div>;
 }

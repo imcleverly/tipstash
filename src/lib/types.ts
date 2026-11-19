@@ -1,6 +1,7 @@
 export type Locale = "vi" | "en";
-export type TopicRole = "viewer" | "editor";
+export type TopicRole = "viewer" | "editor" | "admin";
 export type TopicVisibility = "private" | "unlisted";
+export type ShareAudience = "anyone" | "approvedUsers";
 export type LabelTone = "line-red" | "line-blue" | "line-amber" | "line-green" | "ink";
 
 export interface UserProfile {
@@ -71,11 +72,23 @@ export interface TopicInvitation {
   acceptedAt?: unknown;
 }
 
+export interface AccessRequest {
+  uid: string;
+  email: string;
+  displayName: string;
+  avatarUrl: string | null;
+  status: "pending" | "approved";
+  createdAt?: unknown;
+  approvedAt?: unknown;
+  approvedBy?: string;
+}
+
 export interface PublicShareLink {
   id: string;
   topicId: string;
   ownerUid: string;
   active: boolean;
+  audience?: ShareAudience;
   createdAt?: unknown;
   revokedAt?: unknown;
 }

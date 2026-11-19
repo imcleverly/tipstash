@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { emailSha256, firestoreBearer, firestoreUrl, restFieldString, verifyFirebaseIdToken } from "@/lib/firebase-rest";
+import { emailSha256, firestoreBearer, firestoreUrl, isApprovedFirebaseUser, restFieldString, verifyFirebaseIdToken } from "@/lib/firebase-rest";
 import type { TopicRole } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
@@ -16,6 +16,7 @@ export async function POST(request: Request) {
   const idToken = request.headers.get("authorization")?.replace(/^Bearer\s+/i, "");
   const caller = idToken ? await verifyFirebaseIdToken(idToken) : null;
   if (!caller) return NextResponse.json({ error: "Please sign in again." }, { status: 401 });
+  if (!(await isApprovedFirebaseUser(caller, idToken!))) return NextResponse.json({ error: "An administrator must approve your account first." }, { status: 403 });
 
   let body: { topicId?: unknown; role?: unknown; username?: unknown; email?: unknown };
   try {
